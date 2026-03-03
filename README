@@ -1,0 +1,15 @@
+udpkg
+======
+
+mini clone of the debian package management system.
+
+
+
+how to use
+-----------
+
+udpkg -i	| installs a .deb package.
+udpkg -l	| lists currrent installed packages. 
+udpkg -r	| removes a package.
+udpkg -L	| lists choosen package files.
+udpkg -i -f	| forces a .deb package installation, even if deps are missing.
