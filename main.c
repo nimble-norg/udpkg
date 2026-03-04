@@ -12,6 +12,7 @@
 #include "ctrl.h"
 #include "db.h"
 #include "dep.h"
+#include "lock.h"
 
 #define BATCH_MAX    256
 #define MISS_MAX     128
@@ -503,10 +504,19 @@ static void usage(const char *prog) {
         prog);
 }
 
+static int needs_root(const char *action) {
+    return strcmp(action, "-i") == 0 || strcmp(action, "-r") == 0;
+}
+
 int main(int argc, char *argv[]) {
     int i, ret = 0;
     if (argc < 2) {
         usage(argv[0]);
+        return 1;
+    }
+    if (needs_root(argv[1]) && geteuid() != 0) {
+        fprintf(stderr,
+            "udpkg: error: requested operation requires superuser privilege\n");
         return 1;
     }
     if (db_init() != 0) {
@@ -528,17 +538,24 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "udpkg: -i requires at least one package file\n");
             return 1;
         }
-        return op_install_batch(argv + start, argc - start, force);
+        if (lock_acquire() != 0)
+            return 1;
+        ret = op_install_batch(argv + start, argc - start, force);
+        lock_release();
+        return ret;
     }
     if (strcmp(argv[1], "-r") == 0) {
         if (argc < 3) {
             fprintf(stderr, "udpkg: -r requires at least one package name\n");
             return 1;
         }
+        if (lock_acquire() != 0)
+            return 1;
         for (i = 2; i < argc; i++) {
             if (op_remove(argv[i]) != 0)
                 ret = 1;
         }
+        lock_release();
         return ret;
     }
     if (strcmp(argv[1], "-l") == 0)

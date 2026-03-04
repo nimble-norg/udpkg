@@ -4,3 +4,4 @@ dep.o
 ar.o
 ctrl.o
 db.o
+lock.o
