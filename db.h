@@ -4,10 +4,9 @@
 #include <stddef.h>
 #include "ctrl.h"
 
-#define DB_DIR   "/var/lib/udpkg"
-#define INFO_DIR "/var/lib/udpkg/info"
-#define STATUS_F "/var/lib/udpkg/status"
-#define TMP_CI   "/var/lib/udpkg/tmp.ci"
+void        db_set_root(const char *root);
+const char *db_tmpci(void);
+const char *db_tmpci_ctrl(void);
 
 int db_init(void);
 int db_install(const ctrl_t *c, const char *listfile);

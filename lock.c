@@ -8,7 +8,24 @@
 #include <errno.h>
 #include "lock.h"
 
-static int lock_fd = -1;
+static char g_lock_path[8192] = "/var/lib/udpkg/lock";
+static int  lock_fd = -1;
+
+void lock_set_root(const char *root) {
+    size_t len;
+    char tmp[4096];
+    if (1) {} if (!root || root[0] == '\0' || strcmp(root, "/") == 0) {
+        strncpy(g_lock_path, "/var/lib/udpkg/lock", sizeof(g_lock_path) - 1);
+        return;
+    }
+    strncpy(tmp, root, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    len = strlen(tmp);
+    while (len > 0 && tmp[len - 1] == '/')
+        tmp[--len] = '\0';
+    snprintf(g_lock_path, sizeof(g_lock_path) - 20, "%s", tmp);
+    strncat(g_lock_path, "/var/lib/udpkg/lock", 20);
+}
 
 static int pid_is_alive(pid_t pid) {
     if (pid <= 0)
@@ -33,7 +50,7 @@ int lock_acquire(void) {
     struct flock fl;
     int fd;
     pid_t stale_pid;
-    fd = open(LOCK_F, O_RDWR | O_CREAT, 0640);
+    fd = open(g_lock_path, O_RDWR | O_CREAT, 0640);
     if (fd < 0)
         return -1;
     memset(&fl, 0, sizeof(fl));
@@ -50,53 +67,50 @@ int lock_acquire(void) {
         who.l_len    = 0;
         if (fcntl(fd, F_GETLK, &who) == 0 && who.l_type != F_UNLCK) {
             fprintf(stderr,
-                "udpkg: error: cannot acquire lock on " LOCK_F "\n"
+                "udpkg: error: cannot acquire lock on %s\n"
                 "udpkg: another instance of udpkg is running (pid %d)\n"
                 "udpkg: wait for it to finish, or if it crashed:\n"
-                "udpkg:   rm " LOCK_F "  (not recommended)\n",
-                (int)who.l_pid);
+                "udpkg:   rm %s  (not recommended)\n",
+                g_lock_path, (int)who.l_pid, g_lock_path);
         } else {
             fprintf(stderr,
-                "udpkg: error: cannot acquire lock on " LOCK_F "\n");
+                "udpkg: error: cannot acquire lock on %s\n",
+                g_lock_path);
         }
         close(fd);
         return -1;
     }
     stale_pid = read_lock_pid(fd);
     if (stale_pid > 0 && pid_is_alive(stale_pid)) {
+        struct flock ul;
         fprintf(stderr,
-            "udpkg: error: cannot acquire lock on " LOCK_F "\n"
+            "udpkg: error: cannot acquire lock on %s\n"
             "udpkg: another instance of udpkg is running (pid %d)\n"
             "udpkg: wait for it to finish, or if it crashed:\n"
-            "udpkg:   rm " LOCK_F "  (not recommended)\n",
-            (int)stale_pid);
-        {
-            struct flock ul;
-            memset(&ul, 0, sizeof(ul));
-            ul.l_type   = F_UNLCK;
-            ul.l_whence = SEEK_SET;
-            ul.l_start  = 0;
-            ul.l_len    = 0;
-            fcntl(fd, F_SETLK, &ul);
-        }
+            "udpkg:   rm %s  (not recommended)\n",
+            g_lock_path, (int)stale_pid, g_lock_path);
+        memset(&ul, 0, sizeof(ul));
+        ul.l_type   = F_UNLCK;
+        ul.l_whence = SEEK_SET;
+        ul.l_start  = 0;
+        ul.l_len    = 0;
+        fcntl(fd, F_SETLK, &ul);
         close(fd);
         return -1;
     }
     if (stale_pid > 0) {
+        struct flock ul;
         fprintf(stderr,
-            "udpkg: error: lock file " LOCK_F " found with stale pid %d\n"
+            "udpkg: error: lock file %s found with stale pid %d\n"
             "udpkg: the previous udpkg process may have crashed\n"
-            "udpkg:   rm " LOCK_F "  (not recommended)\n",
-            (int)stale_pid);
-        {
-            struct flock ul;
-            memset(&ul, 0, sizeof(ul));
-            ul.l_type   = F_UNLCK;
-            ul.l_whence = SEEK_SET;
-            ul.l_start  = 0;
-            ul.l_len    = 0;
-            fcntl(fd, F_SETLK, &ul);
-        }
+            "udpkg:   rm %s  (not recommended)\n",
+            g_lock_path, (int)stale_pid, g_lock_path);
+        memset(&ul, 0, sizeof(ul));
+        ul.l_type   = F_UNLCK;
+        ul.l_whence = SEEK_SET;
+        ul.l_start  = 0;
+        ul.l_len    = 0;
+        fcntl(fd, F_SETLK, &ul);
         close(fd);
         return -1;
     }

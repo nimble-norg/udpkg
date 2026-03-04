@@ -1,5 +1,5 @@
 CC     = cc
-CFLAGS = -std=c99 -Wall -Wextra -pedantic -D_POSIX_C_SOURCE=200809L
+CFLAGS = -std=c99 -Wall -Wextra -pedantic -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700
 TARGET = udpkg
 OBJS   = ar.o ctrl.o db.o dep.o lock.o main.o
 
