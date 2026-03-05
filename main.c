@@ -19,14 +19,16 @@
 extern int chroot(const char *);
 
 #define BATCH_MAX      256
-#define MISS_MAX       128
+#define MISS_MAX       DEP_MISS_MAX
 #define IGNORE_DEP_MAX 64
 
 static char g_root[4096]       = "";
 static char g_instdir[4096]    = "";
-static int  g_force_chrootless = 0;
-static int  g_force_deps       = 0;
-static int  g_force_not_root   = 0;
+static int  g_force_chrootless    = 0;
+static int  g_force_deps          = 0;
+static int  g_force_not_root      = 0;
+static int  g_force_overwrite     = 0;
+static int  g_force_overwrite_dir = 0;
 static int  g_simulate         = 0;
 
 static const char *g_ignore_dep[IGNORE_DEP_MAX];
@@ -38,6 +40,42 @@ static const char *effective_instdir(void) {
     if (g_root[0])
         return g_root;
     return "/";
+}
+
+static int cmd_available(const char *cmd) {
+    const char *path_env;
+    char buf[4096];
+    char *p, *save;
+    struct stat st;
+    if (strchr(cmd, '/'))
+        return stat(cmd, &st) == 0 && (st.st_mode & S_IXUSR);
+    path_env = getenv("PATH");
+    if (!path_env)
+        path_env = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    strncpy(buf, path_env, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    p = strtok_r(buf, ":", &save);
+    while (p) {
+        char full[4096];
+        snprintf(full, sizeof(full), "%s/%s", p, cmd);
+        if (stat(full, &st) == 0 && (st.st_mode & S_IXUSR))
+            return 1;
+        p = strtok_r(NULL, ":", &save);
+    }
+    return 0;
+}
+
+static int check_prereqs(void) {
+    static const char * const required[] = { "tar", "rm", "sh", NULL };
+    int i, ok = 1;
+    for (i = 0; required[i]; i++) {
+        if (!cmd_available(required[i])) {
+            fprintf(stderr, "udpkg: required command not found in PATH: %s\n",
+                    required[i]);
+            ok = 0;
+        }
+    }
+    return ok;
 }
 
 static int xrun(char *const argv[]) {
@@ -413,7 +451,7 @@ static int op_install_one(const char *debpath,
     ctrl_t ctrl;
     const char *pkgname, *depends, *arch, *ver;
     dep_list_t dl;
-    char missing[MISS_MAX][DEP_PKG_MAX];
+    char missing[MISS_MAX][DEP_MISS_MAX];
     int nmissing = 0;
     ar_entry_t entry;
     int is_upgrade = 0;
@@ -421,6 +459,8 @@ static int op_install_one(const char *debpath,
     static const char * const mscripts[] =
         { "preinst", "postinst", "prerm", "postrm", NULL };
     int i;
+    if (!g_simulate && !check_prereqs())
+        return -1;
     if (tmpci_setup() != 0) {
         fprintf(stderr, "udpkg: cannot create %s\n", db_tmpci());
         return -1;
@@ -512,6 +552,62 @@ static int op_install_one(const char *debpath,
                 fprintf(stderr, "  missing: %s\n", missing[m]);
         }
     }
+    snprintf(raw_list,  sizeof(raw_list),  "%s/raw.list",  db_tmpci());
+    snprintf(norm_list, sizeof(norm_list), "%s/norm.list", db_tmpci());
+    {
+        char *const argv[] = { "tar", "-tf", data_tar, NULL };
+        xrun_out(argv, raw_list);
+    }
+    normalize_filelist(raw_list, norm_list);
+    {
+        FILE *fp;
+        char line[4096];
+        int conflict_found = 0;
+        fp = fopen(norm_list, "r");
+        if (fp) {
+            while (fgets(line, sizeof(line), fp)) {
+                char owner[256];
+                char fspath[4096];
+                size_t len = strlen(line);
+                int is_dir;
+                while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+                    line[--len] = '\0';
+                if (len == 0)
+                    continue;
+                if (db_find_file_owner(line, pkgname, owner, sizeof(owner)) != 0)
+                    continue;
+                {
+                    const char *base = effective_instdir();
+                    if (strcmp(base, "/") == 0)
+                        strncpy(fspath, line, sizeof(fspath) - 1);
+                    else
+                        snprintf(fspath, sizeof(fspath), "%s%s", base, line);
+                    fspath[sizeof(fspath) - 1] = '\0';
+                }
+                is_dir = (lstat(fspath, &st) == 0 && S_ISDIR(st.st_mode));
+                if (is_dir)
+                    continue;
+                if (g_force_overwrite)
+                    continue;
+                fprintf(stderr,
+                    "udpkg: error: trying to overwrite '%s',"
+                    " which is also in package %s\n",
+                    line, owner);
+                conflict_found = 1;
+            }
+            fclose(fp);
+        }
+        if (conflict_found) {
+            fprintf(stderr,
+                "udpkg: error processing package %s (--install):\n"
+                " conflicting files\n"
+                " Use --force-overwrite to allow overwriting files.\n"
+                " Use --force-overwrite-dir to allow overwriting directories.\n",
+                pkgname);
+            tmpci_cleanup();
+            return -1;
+        }
+    }
     oldver[0] = '\0';
     is_upgrade = db_is_installed(pkgname);
     if (is_upgrade)
@@ -572,13 +668,6 @@ static int op_install_one(const char *debpath,
             }
         }
     }
-    snprintf(raw_list,  sizeof(raw_list),  "%s/raw.list",  db_tmpci());
-    snprintf(norm_list, sizeof(norm_list), "%s/norm.list", db_tmpci());
-    {
-        char *const argv[] = { "tar", "-tf", data_tar, NULL };
-        xrun_out(argv, raw_list);
-    }
-    normalize_filelist(raw_list, norm_list);
     printf("Setting up %s (%s) ...\n", pkgname, ver ? ver : "?");
     if (db_install(&ctrl, norm_list) != 0) {
         fprintf(stderr, "udpkg: failed to update package database\n");
@@ -655,6 +744,8 @@ static int op_remove(const char *name) {
         fprintf(stderr, "udpkg: %s: package not installed\n", name);
         return -1;
     }
+    if (!g_simulate && !check_prereqs())
+        return -1;
     ver[0] = '\0';
     db_get_version(name, ver, sizeof(ver));
     if (db_get(name, &c) == 0)
@@ -742,6 +833,146 @@ static int op_status(const char *name) {
     return 0;
 }
 
+static int extract_data_tar(const char *debpath, char *out_tar, size_t outsz) {
+    char tmpdir[64];
+    ar_entry_t entry;
+    int arfd, ret, found = 0;
+    strncpy(tmpdir, "/tmp/udpkg_xtr_XXXXXX", sizeof(tmpdir) - 1);
+    tmpdir[sizeof(tmpdir) - 1] = '\0';
+    if (!mkdtemp(tmpdir))
+        return -1;
+    memset(&entry, 0, sizeof(entry));
+    arfd = ar_open(debpath);
+    if (arfd < 0) {
+        fprintf(stderr, "udpkg: cannot open '%s': not a valid .deb archive\n",
+                debpath);
+        cleanup_dir(tmpdir);
+        return -1;
+    }
+    while ((ret = ar_next(arfd, &entry)) == 1) {
+        if (strncmp(entry.name, "data.tar", 8) == 0) {
+            snprintf(out_tar, outsz, "%s/%s", tmpdir, entry.name);
+            ar_extract(arfd, &entry, out_tar);
+            found = 1;
+            break;
+        }
+    }
+    close(arfd);
+    if (!found) {
+        fprintf(stderr, "udpkg: malformed .deb: missing data member\n");
+        cleanup_dir(tmpdir);
+        return -1;
+    }
+    return 0;
+}
+
+static int op_extract(const char *debpath, const char *destdir, int verbose) {
+    char data_tar[4096];
+    struct stat st;
+    int rc;
+    if (stat(destdir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "udpkg: %s: not a directory\n", destdir);
+        return -1;
+    }
+    if (extract_data_tar(debpath, data_tar, sizeof(data_tar)) != 0)
+        return -1;
+    {
+        char taropt[8];
+        strncpy(taropt, verbose ? "-xvf" : "-xf", sizeof(taropt) - 1);
+        taropt[sizeof(taropt) - 1] = '\0';
+        {
+            char *const argv[] = { "tar", "-C", (char *)destdir,
+                                   taropt, data_tar, NULL };
+            rc = xrun(argv);
+        }
+    }
+    {
+        char tmpdir[4096];
+        char *slash = strrchr(data_tar, '/');
+        if (slash) {
+            size_t len = (size_t)(slash - data_tar);
+            if (len < sizeof(tmpdir)) {
+                memcpy(tmpdir, data_tar, len);
+                tmpdir[len] = '\0';
+                cleanup_dir(tmpdir);
+            }
+        }
+    }
+    return rc == 0 ? 0 : -1;
+}
+
+static int op_contents(const char *debpath) {
+    char data_tar[4096];
+    int rc;
+    if (extract_data_tar(debpath, data_tar, sizeof(data_tar)) != 0)
+        return -1;
+    {
+        char *const argv[] = { "tar", "-tvf", data_tar, NULL };
+        rc = xrun(argv);
+    }
+    {
+        char tmpdir[4096];
+        char *slash = strrchr(data_tar, '/');
+        if (slash) {
+            size_t len = (size_t)(slash - data_tar);
+            if (len < sizeof(tmpdir)) {
+                memcpy(tmpdir, data_tar, len);
+                tmpdir[len] = '\0';
+                cleanup_dir(tmpdir);
+            }
+        }
+    }
+    return rc == 0 ? 0 : -1;
+}
+
+static int op_show(const char *debpath) {
+    ctrl_t ctrl;
+    const char *name, *ver;
+    if (read_ctrl_from_deb(debpath, &ctrl) != 0) {
+        fprintf(stderr, "udpkg: cannot read control from '%s'\n", debpath);
+        return -1;
+    }
+    name = ctrl_get(&ctrl, "Package");
+    ver  = ctrl_get(&ctrl, "Version");
+    printf("%s %s\n",
+           name ? name : "(unknown)",
+           ver  ? ver  : "(unknown)");
+    return 0;
+}
+
+static int op_field(const char *debpath, char **fields, int nfields) {
+    ctrl_t ctrl;
+    int i;
+    if (read_ctrl_from_deb(debpath, &ctrl) != 0) {
+        fprintf(stderr, "udpkg: cannot read control from '%s'\n", debpath);
+        return -1;
+    }
+    if (nfields == 0) {
+        for (i = 0; i < ctrl.nfields; i++)
+            printf("%s: %s\n", ctrl.fields[i].key, ctrl.fields[i].val);
+        return 0;
+    }
+    if (nfields == 1) {
+        const char *val = ctrl_get(&ctrl, fields[0]);
+        if (!val) {
+            fprintf(stderr, "udpkg: field '%s' not found in control\n",
+                    fields[0]);
+            return -1;
+        }
+        printf("%s\n", val);
+        return 0;
+    }
+    for (i = 0; i < nfields; i++) {
+        const char *val = ctrl_get(&ctrl, fields[i]);
+        if (val)
+            printf("%s: %s\n", fields[i], val);
+        else
+            fprintf(stderr, "udpkg: field '%s' not found in control\n",
+                    fields[i]);
+    }
+    return 0;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [options] <action> ...\n"
@@ -752,8 +983,13 @@ static void usage(const char *prog) {
         "  -l, --list [pattern]                  List installed packages\n"
         "  -L, --list-files <pkg>                List files owned by package\n"
         "  -s, --status <pkg>                    Show package status\n"
+        "  -W, --show <pkg.deb>                  Show name and version\n"
         "      --info <pkg.deb>                  Show package file info\n"
-        "      --help                            Show this help\n"
+        "      --contents <pkg.deb>              List contents of package\n"
+        "      --extract <pkg.deb> <dir>         Extract package files to dir\n"
+        "      --vextract <pkg.deb> <dir>        Extract verbosely to dir\n"
+        "      --field <pkg.deb> [field ...]     Show control field(s)\n"
+        "      --help, -?                        Show this help\n"
         "\n"
         "Options:\n"
         "  -f                             Force install despite dep errors\n"
@@ -766,6 +1002,8 @@ static void usage(const char *prog) {
         "  --ignore-depends=P1[,P2,...]   Ignore dependency on listed packages\n"
         "  --force-script-chrootless      Skip chroot, run scripts on host\n"
         "  --force-not-root               Skip superuser privilege check\n"
+        "  --force-overwrite              Allow overwriting files from other packages\n"
+        "  --force-overwrite-dir          Allow overwriting dirs from other packages\n"
         "  --force-all                    Enable all --force-* options\n",
         prog);
 }
@@ -776,6 +1014,7 @@ static const char *normalize_action(const char *arg) {
     if (strcmp(arg, "--list")       == 0) return "-l";
     if (strcmp(arg, "--list-files") == 0) return "-L";
     if (strcmp(arg, "--status")     == 0) return "-s";
+    if (strcmp(arg, "--show")       == 0) return "-W";
     return arg;
 }
 
@@ -842,10 +1081,16 @@ int main(int argc, char *argv[]) {
             g_force_chrootless = 1;
         } else if (strcmp(argv[i], "--force-not-root") == 0) {
             g_force_not_root = 1;
+        } else if (strcmp(argv[i], "--force-overwrite") == 0) {
+            g_force_overwrite = 1;
+        } else if (strcmp(argv[i], "--force-overwrite-dir") == 0) {
+            g_force_overwrite_dir = 1;
         } else if (strcmp(argv[i], "--force-all") == 0) {
-            g_force_chrootless = 1;
-            g_force_deps       = 1;
-            g_force_not_root   = 1;
+            g_force_chrootless    = 1;
+            g_force_deps          = 1;
+            g_force_not_root      = 1;
+            g_force_overwrite     = 1;
+            g_force_overwrite_dir = 1;
         } else {
             fwd[nfwd++] = argv[i];
         }
@@ -864,6 +1109,12 @@ int main(int argc, char *argv[]) {
         log_close();
         return 1;
     }
+    if (strcmp(fwd[1], "--help") == 0 || strcmp(fwd[1], "-h") == 0
+        || strcmp(fwd[1], "-?") == 0) {
+        usage(fwd[0]);
+        log_close();
+        return 0;
+    }
     if (strcmp(fwd[1], "--info") == 0) {
         int rc = 0;
         if (nfwd < 3) {
@@ -877,6 +1128,56 @@ int main(int argc, char *argv[]) {
         }
         log_close();
         return rc;
+    }
+    if (strcmp(fwd[1], "-W") == 0) {
+        int rc = 0;
+        if (nfwd < 3) {
+            fprintf(stderr, "udpkg: -W/--show requires a package file\n");
+            log_close();
+            return 1;
+        }
+        for (i = 2; i < nfwd; i++) {
+            if (op_show(fwd[i]) != 0)
+                rc = 1;
+        }
+        log_close();
+        return rc;
+    }
+    if (strcmp(fwd[1], "--contents") == 0) {
+        int rc = 0;
+        if (nfwd < 3) {
+            fprintf(stderr, "udpkg: --contents requires a package file\n");
+            log_close();
+            return 1;
+        }
+        for (i = 2; i < nfwd; i++) {
+            if (op_contents(fwd[i]) != 0)
+                rc = 1;
+        }
+        log_close();
+        return rc;
+    }
+    if (strcmp(fwd[1], "--extract") == 0 || strcmp(fwd[1], "--vextract") == 0) {
+        int verbose = (strcmp(fwd[1], "--vextract") == 0);
+        if (nfwd < 4) {
+            fprintf(stderr, "udpkg: %s requires <pkg.deb> <dir>\n", fwd[1]);
+            log_close();
+            return 1;
+        }
+        ret = op_extract(fwd[2], fwd[3], verbose);
+        log_close();
+        return ret == 0 ? 0 : 1;
+    }
+    if (strcmp(fwd[1], "--field") == 0) {
+        int rc;
+        if (nfwd < 3) {
+            fprintf(stderr, "udpkg: --field requires a package file\n");
+            log_close();
+            return 1;
+        }
+        rc = op_field(fwd[2], fwd + 3, nfwd - 3);
+        log_close();
+        return rc == 0 ? 0 : 1;
     }
     db_set_root(g_root);
     if (admindir_arg[0])
@@ -966,11 +1267,6 @@ int main(int argc, char *argv[]) {
         ret = op_status(fwd[2]) == 0 ? 0 : 1;
         log_close();
         return ret;
-    }
-    if (strcmp(fwd[1], "--help") == 0 || strcmp(fwd[1], "-h") == 0) {
-        usage(fwd[0]);
-        log_close();
-        return 0;
     }
     fprintf(stderr, "udpkg: unknown action '%s'\n", fwd[1]);
     usage(fwd[0]);

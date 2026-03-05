@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <fnmatch.h>
 #include <errno.h>
+#include <dirent.h>
 #include "db.h"
 #include "ctrl.h"
 
@@ -492,4 +493,55 @@ int db_remove_scripts(const char *name) {
         unlink(path);
     }
     return 0;
+}
+int db_find_file_owner(const char *filepath, const char *exclude_pkg,
+                       char *owner, size_t ownersz) {
+    char info_dir[4096];
+    DIR *d;
+    struct dirent *de;
+    apath(info_dir, sizeof(info_dir), "/info");
+    d = opendir(info_dir);
+    if (!d)
+        return -1;
+    while ((de = readdir(d)) != NULL) {
+        char *dot;
+        char pkgname[256];
+        char listpath[8192];
+        FILE *fp;
+        char line[4096];
+        size_t nlen;
+        if (de->d_name[0] == '.')
+            continue;
+        dot = strrchr(de->d_name, '.');
+        if (!dot || strcmp(dot, ".list") != 0)
+            continue;
+        nlen = (size_t)(dot - de->d_name);
+        if (nlen >= sizeof(pkgname))
+            nlen = sizeof(pkgname) - 1;
+        memcpy(pkgname, de->d_name, nlen);
+        pkgname[nlen] = '\0';
+        if (exclude_pkg && strcmp(pkgname, exclude_pkg) == 0)
+            continue;
+        snprintf(listpath, sizeof(listpath), "%s/%s", info_dir, de->d_name);
+        fp = fopen(listpath, "r");
+        if (!fp)
+            continue;
+        while (fgets(line, sizeof(line), fp)) {
+            size_t len = strlen(line);
+            while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+                line[--len] = '\0';
+            if (len == 0)
+                continue;
+            if (strcmp(line, filepath) == 0) {
+                fclose(fp);
+                closedir(d);
+                strncpy(owner, pkgname, ownersz - 1);
+                owner[ownersz - 1] = '\0';
+                return 0;
+            }
+        }
+        fclose(fp);
+    }
+    closedir(d);
+    return -1;
 }

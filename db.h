@@ -23,5 +23,7 @@ int db_get_scriptpath(const char *name, const char *script,
 int db_install_script(const char *name, const char *script,
                       const char *srcpath);
 int db_remove_scripts(const char *name);
+int db_find_file_owner(const char *filepath, const char *exclude_pkg,
+                       char *owner, size_t ownersz);
 
 #endif
