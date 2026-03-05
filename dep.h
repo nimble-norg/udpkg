@@ -15,6 +15,7 @@ typedef struct {
     int         ngroups;
 } dep_list_t;
 
+void dep_set_ignore(const char * const *pkgs, int n);
 void dep_parse(const char *depends, dep_list_t *dl);
 
 int dep_check(const dep_list_t *dl,

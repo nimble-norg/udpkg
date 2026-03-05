@@ -4,6 +4,26 @@
 #include "dep.h"
 #include "db.h"
 
+#define IGNORE_MAX 64
+
+static const char *g_ignore[IGNORE_MAX];
+static int         g_nignore = 0;
+
+void dep_set_ignore(const char * const *pkgs, int n) {
+    int i;
+    g_nignore = 0;
+    for (i = 0; i < n && g_nignore < IGNORE_MAX; i++)
+        g_ignore[g_nignore++] = pkgs[i];
+}
+
+static int is_ignored(const char *name) {
+    int i;
+    for (i = 0; i < g_nignore; i++)
+        if (strcmp(g_ignore[i], name) == 0)
+            return 1;
+    return 0;
+}
+
 static void trim(char *s) {
     char *e;
     while (*s == ' ' || *s == '\t')
@@ -70,6 +90,10 @@ int dep_check(const dep_list_t *dl,
         const dep_group_t *g = &dl->groups[i];
         int satisfied = 0;
         for (j = 0; j < g->nalts && !satisfied; j++) {
+            if (is_ignored(g->alts[j])) {
+                satisfied = 1;
+                break;
+            }
             if (db_is_installed(g->alts[j])) {
                 satisfied = 1;
                 break;

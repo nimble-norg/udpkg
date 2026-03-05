@@ -14,13 +14,22 @@
 
 #define BLOCK_MAX 16384
 
-static char g_root[4096] = "";
+static char g_root[4096]    = "";
+static char g_admindir[4096] = "";
 
-static void mkpath(char *buf, size_t sz, const char *suffix) {
-    if (g_root[0])
-        snprintf(buf, sz, "%s%s", g_root, suffix);
-    else
-        snprintf(buf, sz, "%s", suffix);
+static const char *admindir(void) {
+    static char buf[8192];
+    if (g_admindir[0])
+        return g_admindir;
+    if (g_root[0]) {
+        snprintf(buf, sizeof(buf), "%s/var/lib/udpkg", g_root);
+        return buf;
+    }
+    return "/var/lib/udpkg";
+}
+
+static void apath(char *buf, size_t sz, const char *suffix) {
+    snprintf(buf, sz, "%s%s", admindir(), suffix);
 }
 
 void db_set_root(const char *root) {
@@ -36,15 +45,28 @@ void db_set_root(const char *root) {
         g_root[--len] = '\0';
 }
 
+void db_set_admindir(const char *dir) {
+    size_t len;
+    if (!dir || dir[0] == '\0') {
+        g_admindir[0] = '\0';
+        return;
+    }
+    strncpy(g_admindir, dir, sizeof(g_admindir) - 1);
+    g_admindir[sizeof(g_admindir) - 1] = '\0';
+    len = strlen(g_admindir);
+    while (len > 1 && g_admindir[len - 1] == '/')
+        g_admindir[--len] = '\0';
+}
+
 const char *db_tmpci(void) {
     static char buf[4096];
-    mkpath(buf, sizeof(buf), "/var/lib/udpkg/tmp.ci");
+    apath(buf, sizeof(buf), "/tmp.ci");
     return buf;
 }
 
 const char *db_tmpci_ctrl(void) {
     static char buf[4096];
-    mkpath(buf, sizeof(buf), "/var/lib/udpkg/tmp.ci/ctrl");
+    apath(buf, sizeof(buf), "/tmp.ci/ctrl");
     return buf;
 }
 
@@ -110,7 +132,7 @@ static block_node_t *status_read(void) {
     size_t blen = 0;
     block_node_t *head = NULL;
     block_node_t **tail = &head;
-    mkpath(path, sizeof(path), "/var/lib/udpkg/status");
+    apath(path, sizeof(path), "/status");
     fp = fopen(path, "r");
     if (!fp)
         return NULL;
@@ -170,7 +192,7 @@ static int status_write(block_node_t *head) {
     char tmp[8192];
     FILE *fp;
     block_node_t *n;
-    mkpath(path, sizeof(path), "/var/lib/udpkg/status");
+    apath(path, sizeof(path), "/status");
     snprintf(tmp, sizeof(tmp)-4, "%s", path);
     strcat(tmp, ".tmp");
     fp = fopen(tmp, "w");
@@ -188,9 +210,9 @@ int db_init(void) {
     char status_f[4096];
     struct stat st;
     int fd;
-    mkpath(db_dir,   sizeof(db_dir),   "/var/lib/udpkg");
-    mkpath(info_dir, sizeof(info_dir), "/var/lib/udpkg/info");
-    mkpath(status_f, sizeof(status_f), "/var/lib/udpkg/status");
+    snprintf(db_dir,   sizeof(db_dir),   "%s", admindir());
+    apath(info_dir, sizeof(info_dir), "/info");
+    apath(status_f, sizeof(status_f), "/status");
     if (mkdirp(db_dir, 0755) != 0)
         return -1;
     if (mkdirp(info_dir, 0755) != 0)
@@ -216,7 +238,7 @@ int db_install(const ctrl_t *c, const char *listfile) {
     char buf[8192];
     size_t nr;
     FILE *src_fp, *dst_fp;
-    mkpath(info_dir, sizeof(info_dir), "/var/lib/udpkg/info");
+    apath(info_dir, sizeof(info_dir), "/info");
     name = ctrl_get(c, "Package");
     if (!name)
         return -1;
@@ -278,7 +300,7 @@ int db_remove(const char *name) {
     block_node_t *prev = NULL, *cur = list, *next;
     char path[8192];
     int found = 0;
-    mkpath(info_dir, sizeof(info_dir), "/var/lib/udpkg/info");
+    apath(info_dir, sizeof(info_dir), "/info");
     while (cur) {
         next = cur->next;
         if (strcmp(cur->name, name) == 0) {
@@ -402,7 +424,7 @@ int db_list_files(const char *name) {
     FILE *fp;
     {
         char info_dir[4096];
-        mkpath(info_dir, sizeof(info_dir), "/var/lib/udpkg/info");
+        apath(info_dir, sizeof(info_dir), "/info");
         snprintf(path, sizeof(path), "%s/%s.list", info_dir, name);
     }
     fp = fopen(path, "r");
@@ -419,7 +441,7 @@ int db_list_files(const char *name) {
 
 int db_get_listpath(const char *name, char *buf, size_t bufsz) {
     char info_dir[4096];
-    mkpath(info_dir, sizeof(info_dir), "/var/lib/udpkg/info");
+    apath(info_dir, sizeof(info_dir), "/info");
     snprintf(buf, bufsz, "%s/%s.list", info_dir, name);
     return 0;
 }
@@ -427,7 +449,7 @@ int db_get_listpath(const char *name, char *buf, size_t bufsz) {
 int db_get_scriptpath(const char *name, const char *script,
                       char *buf, size_t bufsz) {
     char info_dir[4096];
-    mkpath(info_dir, sizeof(info_dir), "/var/lib/udpkg/info");
+    apath(info_dir, sizeof(info_dir), "/info");
     if (bufsz > 8192) bufsz = 8192;
     snprintf(buf, bufsz, "%s/%s.%s", info_dir, name, script);
     return 0;
@@ -440,7 +462,7 @@ int db_install_script(const char *name, const char *script,
     char buf[8192];
     size_t nr;
     FILE *src_fp, *dst_fp;
-    mkpath(info_dir, sizeof(info_dir), "/var/lib/udpkg/info");
+    apath(info_dir, sizeof(info_dir), "/info");
     snprintf(dst, sizeof(dst), "%s/%s.%s", info_dir, name, script);
     src_fp = fopen(srcpath, "r");
     if (!src_fp)
@@ -464,7 +486,7 @@ int db_remove_scripts(const char *name) {
     static const char * const scripts[] =
         { "preinst", "postinst", "prerm", "postrm", NULL };
     int i;
-    mkpath(info_dir, sizeof(info_dir), "/var/lib/udpkg/info");
+    apath(info_dir, sizeof(info_dir), "/info");
     for (i = 0; scripts[i]; i++) {
         snprintf(path, sizeof(path), "%s/%s.%s", info_dir, name, scripts[i]);
         unlink(path);

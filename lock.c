@@ -139,3 +139,10 @@ void lock_release(void) {
     close(lock_fd);
     lock_fd = -1;
 }
+
+void lock_set_path(const char *path) {
+    if (!path || path[0] == '\0')
+        return;
+    strncpy(g_lock_path, path, sizeof(g_lock_path) - 1);
+    g_lock_path[sizeof(g_lock_path) - 1] = '\0';
+}

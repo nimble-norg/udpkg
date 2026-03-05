@@ -5,6 +5,7 @@
 #include "ctrl.h"
 
 void        db_set_root(const char *root);
+void        db_set_admindir(const char *dir);
 const char *db_tmpci(void);
 const char *db_tmpci_ctrl(void);
 

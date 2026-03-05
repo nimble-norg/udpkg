@@ -2,6 +2,7 @@
 #define UDPKG_LOCK_H
 
 void lock_set_root(const char *root);
+void lock_set_path(const char *path);
 int  lock_acquire(void);
 void lock_release(void);
 
