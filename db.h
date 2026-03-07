@@ -25,5 +25,9 @@ int db_install_script(const char *name, const char *script,
 int db_remove_scripts(const char *name);
 int db_find_file_owner(const char *filepath, const char *exclude_pkg,
                        char *owner, size_t ownersz);
+int db_install_conffiles(const char *name, const char *srcpath);
+int db_get_conffiles_path(const char *name, char *buf, size_t bufsz);
+int db_remove_conffiles(const char *name);
+int db_is_conffile(const char *name, const char *filepath);
 
 #endif

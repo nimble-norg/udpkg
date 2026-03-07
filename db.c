@@ -545,3 +545,63 @@ int db_find_file_owner(const char *filepath, const char *exclude_pkg,
     closedir(d);
     return -1;
 }
+
+int db_install_conffiles(const char *name, const char *srcpath) {
+    char info_dir[4096];
+    char dst[8192];
+    char buf[8192];
+    size_t nr;
+    FILE *src_fp, *dst_fp;
+    apath(info_dir, sizeof(info_dir), "/info");
+    snprintf(dst, sizeof(dst), "%s/%s.conffiles", info_dir, name);
+    src_fp = fopen(srcpath, "r");
+    if (!src_fp)
+        return -1;
+    dst_fp = fopen(dst, "w");
+    if (!dst_fp) {
+        fclose(src_fp);
+        return -1;
+    }
+    while ((nr = fread(buf, 1, sizeof(buf), src_fp)) > 0)
+        fwrite(buf, 1, nr, dst_fp);
+    fclose(src_fp);
+    fclose(dst_fp);
+    return 0;
+}
+
+int db_get_conffiles_path(const char *name, char *buf, size_t bufsz) {
+    char info_dir[4096];
+    apath(info_dir, sizeof(info_dir), "/info");
+    snprintf(buf, bufsz, "%s/%s.conffiles", info_dir, name);
+    return 0;
+}
+
+int db_remove_conffiles(const char *name) {
+    char path[8192];
+    char info_dir[4096];
+    apath(info_dir, sizeof(info_dir), "/info");
+    snprintf(path, sizeof(path), "%s/%s.conffiles", info_dir, name);
+    unlink(path);
+    return 0;
+}
+
+int db_is_conffile(const char *name, const char *filepath) {
+    char path[8192];
+    char line[4096];
+    FILE *fp;
+    db_get_conffiles_path(name, path, sizeof(path));
+    fp = fopen(path, "r");
+    if (!fp)
+        return 0;
+    while (fgets(line, sizeof(line), fp)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+            line[--len] = '\0';
+        if (strcmp(line, filepath) == 0) {
+            fclose(fp);
+            return 1;
+        }
+    }
+    fclose(fp);
+    return 0;
+}

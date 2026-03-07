@@ -30,6 +30,8 @@ static int  g_force_deps          = 0;
 static int  g_force_not_root      = 0;
 static int  g_force_overwrite     = 0;
 static int  g_force_overwrite_dir = 0;
+static int  g_force_confnew       = 0;
+static int  g_force_confold       = 0;
 static int  g_simulate            = 0;
 static int  g_format              = DEB_FMT_AUTO;
 
@@ -124,6 +126,214 @@ static void cleanup_dir(const char *dir) {
     }
     if (pid > 0)
         waitpid(pid, NULL, 0);
+}
+
+#define CONFFILE_MAX  256
+#define CONF_ACT_NEW  1
+#define CONF_ACT_OLD  2
+
+typedef struct {
+    char path[4096];
+    char fspath[4096];
+    char tmpbak[4096];
+    int  existed;
+    int  action;
+} conf_entry_t;
+
+static int copy_file(const char *src, const char *dst) {
+    char buf[8192];
+    ssize_t n;
+    int in, out;
+    in = open(src, O_RDONLY);
+    if (in < 0)
+        return -1;
+    out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out < 0) {
+        close(in);
+        return -1;
+    }
+    while ((n = read(in, buf, sizeof(buf))) > 0) {
+        if (write(out, buf, (size_t)n) != n) {
+            close(in);
+            close(out);
+            return -1;
+        }
+    }
+    close(in);
+    close(out);
+    return n < 0 ? -1 : 0;
+}
+
+static int load_conffiles(const char *ctrl_dir,
+                           conf_entry_t *confs, int *nconfs) {
+    char cfpath[4096];
+    char line[4096];
+    FILE *fp;
+    struct stat st;
+    *nconfs = 0;
+    snprintf(cfpath, sizeof(cfpath), "%s/conffiles", ctrl_dir);
+    if (stat(cfpath, &st) != 0) {
+        snprintf(cfpath, sizeof(cfpath), "%s/DEBIAN/conffiles", ctrl_dir);
+        if (stat(cfpath, &st) != 0)
+            return 0;
+    }
+    fp = fopen(cfpath, "r");
+    if (!fp)
+        return 0;
+    while (fgets(line, sizeof(line), fp) && *nconfs < CONFFILE_MAX) {
+        size_t len = strlen(line);
+        while (len > 0 &&
+               (line[len-1] == '\n' || line[len-1] == '\r' || line[len-1] == ' '))
+            line[--len] = '\0';
+        if (len == 0 || line[0] != '/')
+            continue;
+        strncpy(confs[*nconfs].path,   line, sizeof(confs[0].path)   - 1);
+        confs[*nconfs].path[sizeof(confs[0].path)-1]   = '\0';
+        confs[*nconfs].fspath[0]  = '\0';
+        confs[*nconfs].tmpbak[0]  = '\0';
+        confs[*nconfs].existed    = 0;
+        confs[*nconfs].action     = 0;
+        (*nconfs)++;
+    }
+    fclose(fp);
+    return 0;
+}
+
+static int prompt_conffile(const char *cfpath, const char *fspath) {
+    char answer[64];
+    int action = CONF_ACT_OLD;
+    while (1) {
+        printf("\nConfiguration file '%s'\n", cfpath);
+        printf(" ==> Modified since installation.\n");
+        printf(" ==> Package distributor has shipped an updated version.\n\n");
+        printf("   What would you like to do about it?\n\n");
+        printf("    Y or I  : install the package maintainer's version\n");
+        printf("    N or O  : keep your currently-installed version\n");
+        printf("    Z       : start a shell to examine the situation\n");
+        printf("\n*** '%s' (Y/I/N/O/Z) [default=N] ? ", cfpath);
+        fflush(stdout);
+        if (!fgets(answer, sizeof(answer), stdin)) {
+            action = CONF_ACT_OLD;
+            break;
+        }
+        {
+            size_t len = strlen(answer);
+            while (len > 0 && (answer[len-1] == '\n' || answer[len-1] == '\r'
+                               || answer[len-1] == ' '))
+                answer[--len] = '\0';
+        }
+        if (answer[0] == '\0' || strcmp(answer, "N") == 0
+            || strcmp(answer, "n") == 0 || strcmp(answer, "O") == 0
+            || strcmp(answer, "o") == 0) {
+            action = CONF_ACT_OLD;
+            break;
+        }
+        if (strcmp(answer, "Y") == 0 || strcmp(answer, "y") == 0
+            || strcmp(answer, "I") == 0 || strcmp(answer, "i") == 0) {
+            action = CONF_ACT_NEW;
+            break;
+        }
+        if (strcmp(answer, "Z") == 0 || strcmp(answer, "z") == 0) {
+            pid_t pid;
+            int status;
+            char dir[4096];
+            const char *sh;
+            strncpy(dir, fspath, sizeof(dir) - 1);
+            dir[sizeof(dir) - 1] = '\0';
+            {
+                char *sl = strrchr(dir, '/');
+                if (sl && sl != dir)
+                    *sl = '\0';
+                else
+                    strncpy(dir, "/", sizeof(dir) - 1);
+            }
+            sh = getenv("SHELL");
+            if (!sh || sh[0] == '\0')
+                sh = "/bin/sh";
+            printf("\nType 'exit' to return to the prompt.\n");
+            fflush(stdout);
+            pid = fork();
+            if (pid == 0) {
+                if (chdir(dir) != 0)
+                    chdir("/");
+                execl(sh, sh, (char *)NULL);
+                _exit(127);
+            }
+            if (pid > 0)
+                waitpid(pid, &status, 0);
+        }
+    }
+    return action;
+}
+
+static int conffiles_presave(conf_entry_t *confs, int nconfs,
+                              const char *pkgname, int is_upgrade) {
+    int i;
+    const char *base = effective_instdir();
+    struct stat st;
+    for (i = 0; i < nconfs; i++) {
+        if (strcmp(base, "/") == 0)
+            strncpy(confs[i].fspath, confs[i].path, sizeof(confs[i].fspath) - 1);
+        else
+            snprintf(confs[i].fspath, sizeof(confs[i].fspath),
+                     "%s%s", base, confs[i].path);
+        confs[i].fspath[sizeof(confs[i].fspath) - 1] = '\0';
+        if (lstat(confs[i].fspath, &st) != 0)
+            continue;
+        if (!g_force_confnew && !g_force_confold) {
+            if (is_upgrade && db_is_conffile(pkgname, confs[i].path))
+                continue;
+        }
+        confs[i].existed = 1;
+        {
+            size_t fslen = strlen(confs[i].fspath);
+            size_t tbsz  = sizeof(confs[i].tmpbak);
+            size_t copy  = fslen < tbsz - 10 ? fslen : tbsz - 10;
+            memcpy(confs[i].tmpbak, confs[i].fspath, copy);
+            memcpy(confs[i].tmpbak + copy, ".dpkg-tmp", 10);
+        }
+        copy_file(confs[i].fspath, confs[i].tmpbak);
+    }
+    return 0;
+}
+
+static void conffiles_apply(conf_entry_t *confs, int nconfs) {
+    int i;
+    for (i = 0; i < nconfs; i++) {
+        int act;
+        if (!confs[i].existed)
+            continue;
+        if (g_force_confnew)
+            act = CONF_ACT_NEW;
+        else if (g_force_confold)
+            act = CONF_ACT_OLD;
+        else
+            act = prompt_conffile(confs[i].path, confs[i].fspath);
+        if (act == CONF_ACT_NEW) {
+            char dpkg_old[4096];
+            size_t fslen = strlen(confs[i].fspath);
+            size_t copy  = fslen < sizeof(dpkg_old) - 10 ? fslen : sizeof(dpkg_old) - 10;
+            memcpy(dpkg_old, confs[i].fspath, copy);
+            memcpy(dpkg_old + copy, ".dpkg-old", 10);
+            rename(confs[i].tmpbak, dpkg_old);
+        } else {
+            char dpkg_dist[4096];
+            size_t fslen = strlen(confs[i].fspath);
+            size_t copy  = fslen < sizeof(dpkg_dist) - 11 ? fslen : sizeof(dpkg_dist) - 11;
+            memcpy(dpkg_dist, confs[i].fspath, copy);
+            memcpy(dpkg_dist + copy, ".dpkg-dist", 11);
+            rename(confs[i].fspath, dpkg_dist);
+            rename(confs[i].tmpbak, confs[i].fspath);
+        }
+    }
+}
+
+static void conffiles_cleanup_tmp(conf_entry_t *confs, int nconfs) {
+    int i;
+    for (i = 0; i < nconfs; i++) {
+        if (confs[i].tmpbak[0])
+            unlink(confs[i].tmpbak);
+    }
 }
 
 static int tmpci_setup(void) {
@@ -439,6 +649,9 @@ static int op_install_one(const char *debpath,
     char ctrl_file[4096];
     char raw_list[4096];
     char norm_list[4096];
+    char conffiles_src[4096];
+    conf_entry_t confs[CONFFILE_MAX];
+    int nconfs = 0;
     struct stat st;
     ctrl_t ctrl;
     const char *pkgname, *depends, *arch, *ver;
@@ -501,6 +714,19 @@ static int op_install_one(const char *debpath,
     }
     log_write("format %s %s", pkgname,
               used_fmt == DEB_FMT_OLD ? "old(0.939000)" : "new(2.0)");
+    conffiles_src[0] = '\0';
+    {
+        char cf1[4096], cf2[4096];
+        snprintf(cf1, sizeof(cf1), "%s/conffiles", db_tmpci_ctrl());
+        snprintf(cf2, sizeof(cf2), "%s/DEBIAN/conffiles", db_tmpci_ctrl());
+        if (stat(cf1, &st) == 0)
+            strncpy(conffiles_src, cf1, sizeof(conffiles_src) - 1);
+        else if (stat(cf2, &st) == 0)
+            strncpy(conffiles_src, cf2, sizeof(conffiles_src) - 1);
+        conffiles_src[sizeof(conffiles_src) - 1] = '\0';
+    }
+    if (conffiles_src[0])
+        load_conffiles(db_tmpci_ctrl(), confs, &nconfs);
     arch = ctrl_get(&ctrl, "Architecture");
     ver  = ctrl_get(&ctrl, "Version");
     depends = ctrl_get(&ctrl, "Depends");
@@ -558,6 +784,17 @@ static int op_install_one(const char *debpath,
                     continue;
                 if (db_find_file_owner(line, pkgname, owner, sizeof(owner)) != 0)
                     continue;
+                {
+                    int ci, is_conffile_path = 0;
+                    for (ci = 0; ci < nconfs; ci++) {
+                        if (strcmp(confs[ci].path, line) == 0) {
+                            is_conffile_path = 1;
+                            break;
+                        }
+                    }
+                    if (is_conffile_path)
+                        continue;
+                }
                 {
                     const char *base = effective_instdir();
                     if (strcmp(base, "/") == 0)
@@ -640,15 +877,20 @@ static int op_install_one(const char *debpath,
         char instroot[4096];
         strncpy(instroot, effective_instdir(), sizeof(instroot) - 1);
         instroot[sizeof(instroot) - 1] = '\0';
+        if (nconfs > 0)
+            conffiles_presave(confs, nconfs, pkgname, is_upgrade);
         {
             char *const argv[] =
                 { "tar", "-C", instroot, "-xf", data_tar, NULL };
             if (xrun(argv) != 0) {
                 fprintf(stderr, "udpkg: failed to extract data archive\n");
+                conffiles_cleanup_tmp(confs, nconfs);
                 tmpci_cleanup();
                 return -1;
             }
         }
+        if (nconfs > 0)
+            conffiles_apply(confs, nconfs);
     }
     printf("Setting up %s (%s) ...\n", pkgname, ver ? ver : "?");
     if (db_install(&ctrl, norm_list) != 0) {
@@ -656,6 +898,8 @@ static int op_install_one(const char *debpath,
         tmpci_cleanup();
         return -1;
     }
+    if (conffiles_src[0])
+        db_install_conffiles(pkgname, conffiles_src);
     for (i = 0; mscripts[i]; i++) {
         char src[4096];
         snprintf(src, sizeof(src), "%s/%s", db_tmpci_ctrl(), mscripts[i]);
@@ -775,6 +1019,10 @@ static int op_remove(const char *name) {
     for (i = nfiles - 1; i >= 0; i--) {
         char fpath[4096];
         const char *base = effective_instdir();
+        if (db_is_conffile(name, files[i])) {
+            free(files[i]);
+            continue;
+        }
         if (strcmp(base, "/") == 0)
             strncpy(fpath, files[i], sizeof(fpath) - 1);
         else
@@ -801,6 +1049,39 @@ static int op_remove(const char *name) {
     }
     db_remove_scripts(name);
     return 0;
+}
+
+static int op_purge(const char *name) {
+    char conffiles_path[4096];
+    char line[4096];
+    FILE *fp;
+    struct stat st;
+    int rc;
+    rc = op_remove(name);
+    db_get_conffiles_path(name, conffiles_path, sizeof(conffiles_path));
+    fp = fopen(conffiles_path, "r");
+    if (fp) {
+        while (fgets(line, sizeof(line), fp)) {
+            char fpath[4096];
+            const char *base;
+            size_t len = strlen(line);
+            while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+                line[--len] = '\0';
+            if (len == 0 || line[0] != '/')
+                continue;
+            base = effective_instdir();
+            if (strcmp(base, "/") == 0)
+                strncpy(fpath, line, sizeof(fpath) - 1);
+            else
+                snprintf(fpath, sizeof(fpath), "%s%s", base, line);
+            fpath[sizeof(fpath) - 1] = '\0';
+            if (lstat(fpath, &st) == 0 && !S_ISDIR(st.st_mode))
+                unlink(fpath);
+        }
+        fclose(fp);
+    }
+    db_remove_conffiles(name);
+    return rc;
 }
 
 static int op_status(const char *name) {
@@ -948,6 +1229,7 @@ static void usage(const char *prog) {
         "Actions:\n"
         "  -i, --install [-f] <pkg.deb> [...]   Install package(s)\n"
         "  -r, --remove <pkg> [...]              Remove package(s)\n"
+        "  -P, --purge <pkg> [...]               Purge package(s) and conffiles\n"
         "  -l, --list [pattern]                  List installed packages\n"
         "  -L, --list-files <pkg>                List files owned by package\n"
         "  -s, --status <pkg>                    Show package status\n"
@@ -967,12 +1249,14 @@ static void usage(const char *prog) {
         "  --admindir=DIR                 Override database directory\n"
         "  --instdir=DIR                  Override installation target directory\n"
         "  --log=FILE                     Log operations to FILE\n"
-        "  --ignore-depends=P1[,P2,...]   Ignore dependency on listed packages\n"
         "  --format=FORMAT                auto|new|old  (default: auto)\n"
+        "  --ignore-depends=P1[,P2,...]   Ignore dependency on listed packages\n"
         "  --force-script-chrootless      Skip chroot, run scripts on host\n"
         "  --force-not-root               Skip superuser privilege check\n"
         "  --force-overwrite              Allow overwriting files from other packages\n"
         "  --force-overwrite-dir          Allow overwriting dirs from other packages\n"
+        "  --force-confnew                Always install maintainer's conffile version\n"
+        "  --force-confold                Always keep existing conffile version\n"
         "  --force-all                    Enable all --force-* options\n",
         prog);
 }
@@ -980,6 +1264,7 @@ static void usage(const char *prog) {
 static const char *normalize_action(const char *arg) {
     if (strcmp(arg, "--install")    == 0) return "-i";
     if (strcmp(arg, "--remove")     == 0) return "-r";
+    if (strcmp(arg, "--purge")      == 0) return "-P";
     if (strcmp(arg, "--list")       == 0) return "-l";
     if (strcmp(arg, "--list-files") == 0) return "-L";
     if (strcmp(arg, "--status")     == 0) return "-s";
@@ -988,7 +1273,9 @@ static const char *normalize_action(const char *arg) {
 }
 
 static int needs_root_priv(const char *action) {
-    return strcmp(action, "-i") == 0 || strcmp(action, "-r") == 0;
+    return strcmp(action, "-i") == 0
+        || strcmp(action, "-r") == 0
+        || strcmp(action, "-P") == 0;
 }
 
 static void parse_ignore_depends(const char *val) {
@@ -1064,12 +1351,19 @@ int main(int argc, char *argv[]) {
             g_force_overwrite = 1;
         } else if (strcmp(argv[i], "--force-overwrite-dir") == 0) {
             g_force_overwrite_dir = 1;
+        } else if (strcmp(argv[i], "--force-confnew") == 0) {
+            g_force_confnew = 1;
+            g_force_confold = 0;
+        } else if (strcmp(argv[i], "--force-confold") == 0) {
+            g_force_confold = 1;
+            g_force_confnew = 0;
         } else if (strcmp(argv[i], "--force-all") == 0) {
             g_force_chrootless    = 1;
             g_force_deps          = 1;
             g_force_not_root      = 1;
             g_force_overwrite     = 1;
             g_force_overwrite_dir = 1;
+            g_force_confnew       = 1;
         } else {
             fwd[nfwd++] = argv[i];
         }
@@ -1215,6 +1509,25 @@ int main(int argc, char *argv[]) {
         }
         for (i = 2; i < nfwd; i++) {
             if (op_remove(fwd[i]) != 0)
+                ret = 1;
+        }
+        if (!g_simulate)
+            lock_release();
+        log_close();
+        return ret;
+    }
+    if (strcmp(fwd[1], "-P") == 0) {
+        if (nfwd < 3) {
+            fprintf(stderr, "udpkg: -P requires at least one package name\n");
+            log_close();
+            return 1;
+        }
+        if (!g_simulate && lock_acquire() != 0) {
+            log_close();
+            return 1;
+        }
+        for (i = 2; i < nfwd; i++) {
+            if (op_purge(fwd[i]) != 0)
                 ret = 1;
         }
         if (!g_simulate)
