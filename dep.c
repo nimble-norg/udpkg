@@ -109,6 +109,10 @@ static int ver_compare(const char *a, const char *b) {
     return ver_cmp_str(ra, rb);
 }
 
+int ver_cmp_public(const char *a, const char *b) {
+    return ver_compare(a, b);
+}
+
 static int ver_satisfies(const char *installed, int op, const char *required) {
     int c;
     if (op == DEPOP_NONE)

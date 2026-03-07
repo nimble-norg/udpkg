@@ -33,4 +33,6 @@ int dep_check(const dep_list_t *dl,
               const char * const *batch, int nbatch,
               char missing[][DEP_MISS_MAX], int *nmissing, int miss_cap);
 
+int ver_cmp_public(const char *a, const char *b);
+
 #endif

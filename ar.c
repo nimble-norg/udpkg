@@ -1,9 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
 #include <fcntl.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include "ar.h"
 
 #define AR_MAGIC "!<arch>\n"
@@ -79,5 +82,103 @@ int ar_extract(int fd, const ar_entry_t *entry, const char *destpath) {
         remaining -= (size_t)n;
     }
     close(outfd);
+    return 0;
+}
+
+static void ar_fmt_field(char *dst, size_t dstsz, const char *val) {
+    size_t vlen = strlen(val);
+    size_t i;
+    if (vlen > dstsz)
+        vlen = dstsz;
+    for (i = 0; i < vlen; i++)
+        dst[i] = val[i];
+    for (; i < dstsz; i++)
+        dst[i] = ' ';
+}
+
+static int ar_write_hdr(int fd, const char *membername,
+                        size_t datasz, time_t mtime,
+                        unsigned uid, unsigned gid, unsigned mode) {
+    char hdr[60];
+    char tmp[32];
+    memset(hdr, ' ', sizeof(hdr));
+    ar_fmt_field(hdr,      16, membername);
+    snprintf(tmp, sizeof(tmp), "%lu", (unsigned long)mtime);
+    ar_fmt_field(hdr + 16, 12, tmp);
+    snprintf(tmp, sizeof(tmp), "%u",  uid);
+    ar_fmt_field(hdr + 28, 6,  tmp);
+    snprintf(tmp, sizeof(tmp), "%u",  gid);
+    ar_fmt_field(hdr + 34, 6,  tmp);
+    snprintf(tmp, sizeof(tmp), "%o",  mode & 07777u);
+    ar_fmt_field(hdr + 40, 8,  tmp);
+    snprintf(tmp, sizeof(tmp), "%lu", (unsigned long)datasz);
+    ar_fmt_field(hdr + 48, 10, tmp);
+    hdr[58] = '`';
+    hdr[59] = '\n';
+    return write(fd, hdr, 60) == 60 ? 0 : -1;
+}
+
+int ar_create(const char *path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return -1;
+    if (write(fd, AR_MAGIC, 8) != 8) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+int ar_append_file(int fd, const char *membername, const char *srcpath) {
+    struct stat st;
+    char buf[8192];
+    ssize_t n;
+    int in;
+    size_t remaining;
+    if (stat(srcpath, &st) != 0)
+        return -1;
+    if (ar_write_hdr(fd, membername, (size_t)st.st_size,
+                     st.st_mtime, (unsigned)st.st_uid,
+                     (unsigned)st.st_gid,
+                     (unsigned)st.st_mode) != 0)
+        return -1;
+    in = open(srcpath, O_RDONLY);
+    if (in < 0)
+        return -1;
+    remaining = (size_t)st.st_size;
+    while (remaining > 0) {
+        size_t want = remaining < sizeof(buf) ? remaining : sizeof(buf);
+        n = read(in, buf, want);
+        if (n <= 0) {
+            close(in);
+            return -1;
+        }
+        if ((size_t)write(fd, buf, (size_t)n) != (size_t)n) {
+            close(in);
+            return -1;
+        }
+        remaining -= (size_t)n;
+    }
+    close(in);
+    if (st.st_size % 2 != 0) {
+        char pad = '\n';
+        if (write(fd, &pad, 1) != 1)
+            return -1;
+    }
+    return 0;
+}
+
+int ar_append_data(int fd, const char *membername,
+                   const void *data, size_t datasz) {
+    time_t now = (time_t)0;
+    if (ar_write_hdr(fd, membername, datasz, now, 0, 0, 0100644) != 0)
+        return -1;
+    if (datasz > 0 && (size_t)write(fd, data, datasz) != datasz)
+        return -1;
+    if (datasz % 2 != 0) {
+        char pad = '\n';
+        if (write(fd, &pad, 1) != 1)
+            return -1;
+    }
     return 0;
 }

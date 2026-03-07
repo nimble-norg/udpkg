@@ -15,4 +15,9 @@ int ar_open(const char *path);
 int ar_next(int fd, ar_entry_t *entry);
 int ar_extract(int fd, const ar_entry_t *entry, const char *destpath);
 
+int ar_create(const char *path);
+int ar_append_file(int fd, const char *membername, const char *srcpath);
+int ar_append_data(int fd, const char *membername,
+                   const void *data, size_t datasz);
+
 #endif

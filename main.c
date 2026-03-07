@@ -32,6 +32,22 @@ static int  g_force_overwrite     = 0;
 static int  g_force_overwrite_dir = 0;
 static int  g_force_confnew       = 0;
 static int  g_force_confold       = 0;
+static int  g_skip_same_version   = 0;
+static int  g_refuse_downgrade    = 0;
+static int  g_no_check            = 0;
+static int  g_build_fmt           = DEB_FMT_NEW;
+
+#define COMP_GZIP 0
+#define COMP_XZ   1
+#define COMP_ZSTD 2
+#define COMP_NONE 3
+static int  g_compression         = COMP_GZIP;
+static int  g_comp_level          = -1;
+static int  g_comp_strat_gz       = -1;
+static int  g_comp_strat_xz       = 0;
+static int  g_verbose             = 0;
+static int  g_root_owner_group    = 0;
+static int  g_abort_after         = 0;
 static int  g_simulate            = 0;
 static int  g_format              = DEB_FMT_AUTO;
 
@@ -664,7 +680,7 @@ static int op_install_one(const char *debpath,
     static const char * const mscripts[] =
         { "preinst", "postinst", "prerm", "postrm", NULL };
     int i;
-    if (!g_simulate && !check_prereqs())
+    if (!g_simulate && !g_no_check && !check_prereqs())
         return -1;
     if (tmpci_setup() != 0) {
         fprintf(stderr, "udpkg: cannot create %s\n", db_tmpci());
@@ -729,6 +745,32 @@ static int op_install_one(const char *debpath,
         load_conffiles(db_tmpci_ctrl(), confs, &nconfs);
     arch = ctrl_get(&ctrl, "Architecture");
     ver  = ctrl_get(&ctrl, "Version");
+    {
+        char inst_ver[256];
+        inst_ver[0] = '\0';
+        if (db_is_installed(pkgname))
+            db_get_version(pkgname, inst_ver, sizeof(inst_ver));
+        if (inst_ver[0] && ver) {
+            if (g_skip_same_version) {
+                int cmp = ver_cmp_public(ver, inst_ver);
+                if (cmp == 0) {
+                    printf("udpkg: %s: skipping, same version (%s) already installed\n",
+                           pkgname, inst_ver);
+                    tmpci_cleanup();
+                    return 0;
+                }
+            }
+            if (g_refuse_downgrade) {
+                int cmp = ver_cmp_public(ver, inst_ver);
+                if (cmp < 0) {
+                    printf("udpkg: %s: skipping, would downgrade from %s to %s\n",
+                           pkgname, inst_ver, ver);
+                    tmpci_cleanup();
+                    return 0;
+                }
+            }
+        }
+    }
     depends = ctrl_get(&ctrl, "Depends");
     dep_parse(depends ? depends : "", &dl);
     dep_check(&dl, batch, nbatch, missing, &nmissing, MISS_MAX);
@@ -932,7 +974,7 @@ static int op_install_batch(char **debpaths, int ndeb, int force) {
     int nbatch = 0;
     ctrl_t ctrl;
     const char *pkgname;
-    int i, ret = 0;
+    int i, ret = 0, nerr = 0;
     log_write("startup archives install");
     for (i = 0; i < ndeb && nbatch < BATCH_MAX; i++) {
         if (read_ctrl_from_deb(debpaths[i], &ctrl) == 0) {
@@ -947,8 +989,18 @@ static int op_install_batch(char **debpaths, int ndeb, int force) {
     for (i = 0; i < ndeb; i++) {
         if (op_install_one(debpaths[i],
                            (const char * const *)batch_names, nbatch,
-                           force) != 0)
+                           force) != 0) {
             ret = 1;
+            if (g_abort_after > 0) {
+                nerr++;
+                if (nerr >= g_abort_after) {
+                    fprintf(stderr,
+                        "udpkg: abort-after limit (%d) reached\n",
+                        g_abort_after);
+                    break;
+                }
+            }
+        }
     }
     for (i = 0; i < nbatch; i++)
         free(batch_names[i]);
@@ -970,7 +1022,7 @@ static int op_remove(const char *name) {
         fprintf(stderr, "udpkg: %s: package not installed\n", name);
         return -1;
     }
-    if (!g_simulate && !check_prereqs())
+    if (!g_simulate && !g_no_check && !check_prereqs())
         return -1;
     ver[0] = '\0';
     db_get_version(name, ver, sizeof(ver));
@@ -1056,9 +1108,16 @@ static int op_purge(const char *name) {
     char line[4096];
     FILE *fp;
     struct stat st;
-    int rc;
-    rc = op_remove(name);
+    int has_conffiles;
+    int rc = 0;
     db_get_conffiles_path(name, conffiles_path, sizeof(conffiles_path));
+    has_conffiles = (stat(conffiles_path, &st) == 0);
+    if (!db_is_installed(name) && !has_conffiles) {
+        fprintf(stderr, "udpkg: %s: package not installed\n", name);
+        return -1;
+    }
+    if (db_is_installed(name))
+        rc = op_remove(name);
     fp = fopen(conffiles_path, "r");
     if (fp) {
         while (fgets(line, sizeof(line), fp)) {
@@ -1222,6 +1281,307 @@ static int op_field(const char *debpath, char **fields, int nfields) {
     return 0;
 }
 
+static const char *comp_tar_flag(void) {
+    switch (g_compression) {
+        case COMP_XZ:   return "-J";
+        case COMP_ZSTD: return "--zstd";
+        case COMP_NONE: return NULL;
+        default:        return "-z";
+    }
+}
+
+static const char *comp_ext(void) {
+    switch (g_compression) {
+        case COMP_XZ:   return ".xz";
+        case COMP_ZSTD: return ".zst";
+        case COMP_NONE: return "";
+        default:        return ".gz";
+    }
+}
+
+static int build_tar(const char *srcdir, const char *exclude,
+                     const char *outpath) {
+    const char *flag = comp_tar_flag();
+    char prog_buf[128];
+    char *argv[24];
+    int n = 0;
+    int use_prog = 0;
+    prog_buf[0] = '\0';
+    if (g_compression == COMP_GZIP) {
+        if (g_comp_level >= 0) {
+            snprintf(prog_buf, sizeof(prog_buf), "gzip -%d", g_comp_level);
+            use_prog = 1;
+        }
+    } else if (g_compression == COMP_XZ) {
+        if (g_comp_level >= 0 || g_comp_strat_xz == 1) {
+            int pos = 0;
+            pos += snprintf(prog_buf + pos, sizeof(prog_buf) - (size_t)pos,
+                            "xz");
+            if (g_comp_level >= 0)
+                pos += snprintf(prog_buf + pos, sizeof(prog_buf) - (size_t)pos,
+                                " -%d", g_comp_level);
+            if (g_comp_strat_xz == 1)
+                pos += snprintf(prog_buf + pos, sizeof(prog_buf) - (size_t)pos,
+                                " --extreme");
+            use_prog = 1;
+            (void)pos;
+        }
+    } else if (g_compression == COMP_ZSTD) {
+        if (g_comp_level >= 0) {
+            snprintf(prog_buf, sizeof(prog_buf), "zstd -%d", g_comp_level);
+            use_prog = 1;
+        }
+    }
+    argv[n++] = "tar";
+    argv[n++] = "-C";
+    argv[n++] = (char *)srcdir;
+    if (g_verbose)
+        argv[n++] = "-v";
+    if (use_prog) {
+        argv[n++] = "-I";
+        argv[n++] = prog_buf;
+    } else if (flag) {
+        argv[n++] = (char *)flag;
+    }
+    argv[n++] = "-cf";
+    argv[n++] = (char *)outpath;
+    if (exclude) {
+        argv[n++] = "--exclude";
+        argv[n++] = (char *)exclude;
+    }
+    argv[n++] = ".";
+    argv[n]   = NULL;
+    return xrun(argv);
+}
+
+static int op_extract_control(const char *debpath, const char *outdir) {
+    char tmpdir[64];
+    char ctrl_tar[4096];
+    struct stat st;
+    int used_fmt;
+    if (!g_no_check && !cmd_available("tar")) {
+        fprintf(stderr, "udpkg: required command not found in PATH: tar\n");
+        return -1;
+    }
+    strncpy(tmpdir, "/tmp/udpkg_ce_XXXXXX", sizeof(tmpdir) - 1);
+    tmpdir[sizeof(tmpdir) - 1] = '\0';
+    if (!mkdtemp(tmpdir)) {
+        fprintf(stderr, "udpkg: cannot create tmpdir\n");
+        return -1;
+    }
+    if (deb_open(debpath, g_format, tmpdir,
+                 ctrl_tar, sizeof(ctrl_tar), NULL,
+                 NULL, 0,
+                 1, 0, &used_fmt) != 0) {
+        fprintf(stderr, "udpkg: cannot open '%s': not a valid .deb archive\n",
+                debpath);
+        cleanup_dir(tmpdir);
+        return -1;
+    }
+    if (stat(outdir, &st) != 0) {
+        if (mkdir(outdir, 0755) != 0) {
+            fprintf(stderr, "udpkg: cannot create directory '%s'\n", outdir);
+            cleanup_dir(tmpdir);
+            return -1;
+        }
+    }
+    {
+        char *const argv[] =
+            { "tar", "-xf", ctrl_tar, "-C", (char *)outdir, NULL };
+        if (xrun(argv) != 0) {
+            fprintf(stderr, "udpkg: failed to extract control archive\n");
+            cleanup_dir(tmpdir);
+            return -1;
+        }
+    }
+    cleanup_dir(tmpdir);
+    return 0;
+}
+
+static int write_old_deb(const char *outpath,
+                          const char *ctrl_tar, const char *data_tar) {
+    char buf[8192];
+    ssize_t n;
+    int out, in;
+    struct stat st;
+    if (stat(ctrl_tar, &st) != 0)
+        return -1;
+    out = open(outpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out < 0)
+        return -1;
+    {
+        char hdr[64];
+        int hlen;
+        hlen = snprintf(hdr, sizeof(hdr),
+                        "0.939000\n%lu\n", (unsigned long)st.st_size);
+        if (write(out, hdr, (size_t)hlen) != hlen) {
+            close(out);
+            return -1;
+        }
+    }
+    in = open(ctrl_tar, O_RDONLY);
+    if (in < 0) {
+        close(out);
+        return -1;
+    }
+    while ((n = read(in, buf, sizeof(buf))) > 0) {
+        if (write(out, buf, (size_t)n) != n) {
+            close(in);
+            close(out);
+            return -1;
+        }
+    }
+    close(in);
+    in = open(data_tar, O_RDONLY);
+    if (in < 0) {
+        close(out);
+        return -1;
+    }
+    while ((n = read(in, buf, sizeof(buf))) > 0) {
+        if (write(out, buf, (size_t)n) != n) {
+            close(in);
+            close(out);
+            return -1;
+        }
+    }
+    close(in);
+    close(out);
+    return 0;
+}
+
+static int check_build_ctrl(const char *ctrl_path) {
+    ctrl_t c;
+    static const char * const required[] =
+        { "Package", "Version", "Architecture", "Maintainer", "Description", NULL };
+    int i, ok = 1;
+    if (ctrl_parse(ctrl_path, &c) != 0) {
+        fprintf(stderr, "udpkg: cannot parse control file '%s'\n", ctrl_path);
+        return -1;
+    }
+    for (i = 0; required[i]; i++) {
+        if (!ctrl_get(&c, required[i])) {
+            fprintf(stderr,
+                "udpkg: control file missing required field: %s\n", required[i]);
+            ok = 0;
+        }
+    }
+    return ok ? 0 : -1;
+}
+
+static int op_build(const char *srcdir, const char *outarg) {
+    char debian_dir[4096];
+    char ctrl_path[4096];
+    char tmpdir[64];
+    char ctrl_tar[4096];
+    char data_tar[4096];
+    char ctrl_member[64];
+    char data_member[64];
+    char outpath[4096];
+    struct stat st;
+    int arfd, rc = 0;
+    if (!g_no_check && !cmd_available("tar")) {
+        fprintf(stderr, "udpkg: required command not found in PATH: tar\n");
+        return -1;
+    }
+    snprintf(debian_dir, sizeof(debian_dir), "%s/DEBIAN", srcdir);
+    snprintf(ctrl_path,  sizeof(ctrl_path),  "%s/DEBIAN/control", srcdir);
+    if (stat(debian_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr,
+            "udpkg: %s: DEBIAN directory not found\n", srcdir);
+        return -1;
+    }
+    if (stat(ctrl_path, &st) != 0) {
+        fprintf(stderr,
+            "udpkg: %s: control file not found\n", debian_dir);
+        return -1;
+    }
+    {
+        struct stat dst;
+        int perm_err = 0;
+        if (stat(debian_dir, &dst) == 0) {
+            if ((dst.st_mode & 07777) != 0755 || dst.st_uid != 0 || dst.st_gid != 0) {
+                fprintf(stderr,
+                    "udpkg: %s: DEBIAN directory should be 755 root:root\n",
+                    g_root_owner_group ? "error" : "warning");
+                perm_err = 1;
+            }
+        }
+        if ((st.st_mode & 07777) != 0644 || st.st_uid != 0 || st.st_gid != 0) {
+            fprintf(stderr,
+                "udpkg: %s: control file should be 644 root:root\n",
+                g_root_owner_group ? "error" : "warning");
+            perm_err = 1;
+        }
+        if (g_root_owner_group && perm_err)
+            return -1;
+    }
+    if (check_build_ctrl(ctrl_path) != 0)
+        return -1;
+    if (outarg && outarg[0]) {
+        strncpy(outpath, outarg, sizeof(outpath) - 1);
+        outpath[sizeof(outpath) - 1] = '\0';
+    } else {
+        const char *base = srcdir;
+        const char *sl   = strrchr(srcdir, '/');
+        if (sl && sl[1])
+            base = sl + 1;
+        else if (sl && sl == srcdir)
+            base = sl + 1;
+        snprintf(outpath, sizeof(outpath), "%s.deb", base);
+    }
+    strncpy(tmpdir, "/tmp/udpkg_bld_XXXXXX", sizeof(tmpdir) - 1);
+    tmpdir[sizeof(tmpdir) - 1] = '\0';
+    if (!mkdtemp(tmpdir)) {
+        fprintf(stderr, "udpkg: cannot create build tmpdir\n");
+        return -1;
+    }
+    snprintf(ctrl_member, sizeof(ctrl_member), "control.tar%s", comp_ext());
+    snprintf(data_member, sizeof(data_member), "data.tar%s",    comp_ext());
+    snprintf(ctrl_tar, sizeof(ctrl_tar), "%s/%s", tmpdir, ctrl_member);
+    snprintf(data_tar, sizeof(data_tar), "%s/%s", tmpdir, data_member);
+    if (build_tar(debian_dir, NULL, ctrl_tar) != 0) {
+        fprintf(stderr, "udpkg: failed to build control archive\n");
+        cleanup_dir(tmpdir);
+        return -1;
+    }
+    if (build_tar(srcdir, "./DEBIAN", data_tar) != 0) {
+        fprintf(stderr, "udpkg: failed to build data archive\n");
+        cleanup_dir(tmpdir);
+        return -1;
+    }
+    if (g_build_fmt == DEB_FMT_OLD) {
+        rc = write_old_deb(outpath, ctrl_tar, data_tar);
+        if (rc != 0)
+            fprintf(stderr, "udpkg: failed to write old-format deb\n");
+    } else {
+        arfd = ar_create(outpath);
+        if (arfd < 0) {
+            fprintf(stderr, "udpkg: cannot create '%s'\n", outpath);
+            cleanup_dir(tmpdir);
+            return -1;
+        }
+        if (ar_append_data(arfd, "debian-binary", "2.0\n", 4) != 0
+            || ar_append_file(arfd, ctrl_member, ctrl_tar) != 0
+            || ar_append_file(arfd, data_member, data_tar) != 0) {
+            fprintf(stderr, "udpkg: error writing ar members\n");
+            close(arfd);
+            cleanup_dir(tmpdir);
+            return -1;
+        }
+        close(arfd);
+    }
+    cleanup_dir(tmpdir);
+    if (rc == 0) {
+        ctrl_t c;
+        const char *pkgname = "?";
+        if (ctrl_parse(ctrl_path, &c) == 0)
+            pkgname = ctrl_get(&c, "Package");
+        printf("dpkg-deb: building package '%s' in '%s'\n",
+               pkgname ? pkgname : "?", outpath);
+    }
+    return rc;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [options] <action> ...\n"
@@ -1230,10 +1590,13 @@ static void usage(const char *prog) {
         "  -i, --install [-f] <pkg.deb> [...]   Install package(s)\n"
         "  -r, --remove <pkg> [...]              Remove package(s)\n"
         "  -P, --purge <pkg> [...]               Purge package(s) and conffiles\n"
+        "  -b, --build <dir> [<output.deb>]      Build a .deb from a directory\n"
+        "  -e, --control <pkg.deb> <dir>         Extract control files to dir\n"
         "  -l, --list [pattern]                  List installed packages\n"
         "  -L, --list-files <pkg>                List files owned by package\n"
         "  -s, --status <pkg>                    Show package status\n"
         "  -W, --show <pkg.deb>                  Show name and version\n"
+        "      --showformat=<pkg.deb>            Like --show, uses --format= explicitly\n"
         "      --info <pkg.deb>                  Show package file info\n"
         "      --contents <pkg.deb>              List contents of package\n"
         "      --extract <pkg.deb> <dir>         Extract package files to dir\n"
@@ -1249,7 +1612,18 @@ static void usage(const char *prog) {
         "  --admindir=DIR                 Override database directory\n"
         "  --instdir=DIR                  Override installation target directory\n"
         "  --log=FILE                     Log operations to FILE\n"
-        "  --format=FORMAT                auto|new|old  (default: auto)\n"
+        "  --format=auto|new|old          Force package format for reading (default: auto)\n"
+        "  --deb-format=2.0|0.939000      Package format for --build (default: 2.0)\n"
+        "  -Z gzip|xz|zstd|none          Compression for --build (default: gzip)\n"
+        "  --compression=gzip|xz|...     Same as -Z\n"
+        "  -z <level>                     Compression level (0-9) for --build\n"
+        "  --compression-level=<level>   Same as -z\n"
+        "  -S <strategy>                  Compression strategy for --build (gzip/xz only)\n"
+        "  --compression-strategy=<s>    Same as -S\n"
+        "                                 gzip: filtered, huffman, rle, fixed\n"
+        "                                 xz:   none, extreme\n"
+        "  -v, --verbose                  Verbose output during --build\n"
+        "  --root-owner-group             Make perm warnings in --build into errors\n"
         "  --ignore-depends=P1[,P2,...]   Ignore dependency on listed packages\n"
         "  --force-script-chrootless      Skip chroot, run scripts on host\n"
         "  --force-not-root               Skip superuser privilege check\n"
@@ -1257,6 +1631,10 @@ static void usage(const char *prog) {
         "  --force-overwrite-dir          Allow overwriting dirs from other packages\n"
         "  --force-confnew                Always install maintainer's conffile version\n"
         "  --force-confold                Always keep existing conffile version\n"
+        "  -E, --skip-same-version        Skip install if same version already installed\n"
+        "  -G, --refuse-downgrade         Skip install if it would downgrade the package\n"
+        "  --no-check, --nocheck          Skip PATH tool availability checks\n"
+        "  --abort-after=<n>              Abort batch operation after <n> errors\n"
         "  --force-all                    Enable all --force-* options\n",
         prog);
 }
@@ -1265,6 +1643,8 @@ static const char *normalize_action(const char *arg) {
     if (strcmp(arg, "--install")    == 0) return "-i";
     if (strcmp(arg, "--remove")     == 0) return "-r";
     if (strcmp(arg, "--purge")      == 0) return "-P";
+    if (strcmp(arg, "--build")      == 0) return "-b";
+    if (strcmp(arg, "--control")    == 0) return "-e";
     if (strcmp(arg, "--list")       == 0) return "-l";
     if (strcmp(arg, "--list-files") == 0) return "-L";
     if (strcmp(arg, "--status")     == 0) return "-s";
@@ -1299,7 +1679,7 @@ static void parse_ignore_depends(const char *val) {
 int main(int argc, char *argv[]) {
     char *fwd[1024];
     int  nfwd = 0;
-    int  i, ret = 0;
+    int  i, ret = 0, nerr = 0;
     char admindir_arg[4096] = "";
     for (i = 0; i < argc && nfwd < 1024; i++) {
         if (strncmp(argv[i], "--root=", 7) == 0) {
@@ -1324,6 +1704,43 @@ int main(int argc, char *argv[]) {
                     g_instdir[--len] = '\0';
                 if (strcmp(g_instdir, "/") == 0)
                     g_instdir[0] = '\0';
+            }
+        } else if (strcmp(argv[i], "-Z") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "udpkg: -Z requires an argument\n");
+                return 1;
+            }
+            i++;
+            if (strcmp(argv[i], "gzip") == 0)       g_compression = COMP_GZIP;
+            else if (strcmp(argv[i], "xz")   == 0)  g_compression = COMP_XZ;
+            else if (strcmp(argv[i], "zstd") == 0)  g_compression = COMP_ZSTD;
+            else if (strcmp(argv[i], "none") == 0)  g_compression = COMP_NONE;
+            else {
+                fprintf(stderr,
+                    "udpkg: unknown compression '%s' (use: gzip, xz, zstd, none)\n",
+                    argv[i]);
+                return 1;
+            }
+        } else if (strncmp(argv[i], "--compression=", 14) == 0) {
+            const char *val = argv[i] + 14;
+            if (strcmp(val, "gzip") == 0)       g_compression = COMP_GZIP;
+            else if (strcmp(val, "xz")   == 0)  g_compression = COMP_XZ;
+            else if (strcmp(val, "zstd") == 0)  g_compression = COMP_ZSTD;
+            else if (strcmp(val, "none") == 0)  g_compression = COMP_NONE;
+            else {
+                fprintf(stderr,
+                    "udpkg: unknown compression '%s' (use: gzip, xz, zstd, none)\n",
+                    val);
+                return 1;
+            }
+        } else if (strncmp(argv[i], "--deb-format=", 13) == 0) {
+            const char *val = argv[i] + 13;
+            if (strcmp(val, "2.0")      == 0) g_build_fmt = DEB_FMT_NEW;
+            else if (strcmp(val, "0.939000") == 0) g_build_fmt = DEB_FMT_OLD;
+            else {
+                fprintf(stderr,
+                    "udpkg: unknown deb format '%s' (use: 2.0, 0.939000)\n", val);
+                return 1;
             }
         } else if (strncmp(argv[i], "--format=", 9) == 0) {
             const char *val = argv[i] + 9;
@@ -1357,6 +1774,105 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--force-confold") == 0) {
             g_force_confold = 1;
             g_force_confnew = 0;
+        } else if (strcmp(argv[i], "-E") == 0
+                   || strcmp(argv[i], "--skip-same-version") == 0) {
+            g_skip_same_version = 1;
+        } else if (strcmp(argv[i], "-G") == 0
+                   || strcmp(argv[i], "--refuse-downgrade") == 0) {
+            g_refuse_downgrade = 1;
+        } else if (strcmp(argv[i], "--no-check") == 0
+                   || strcmp(argv[i], "--nocheck") == 0) {
+            g_no_check = 1;
+        } else if (strcmp(argv[i], "-v") == 0
+                   || strcmp(argv[i], "--verbose") == 0) {
+            g_verbose = 1;
+        } else if (strcmp(argv[i], "--root-owner-group") == 0) {
+            g_root_owner_group = 1;
+        } else if (strcmp(argv[i], "-z") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "udpkg: -z requires a level argument\n");
+                return 1;
+            }
+            i++;
+            g_comp_level = atoi(argv[i]);
+            if (g_comp_level < 0 || g_comp_level > 9) {
+                fprintf(stderr,
+                    "udpkg: compression level must be 0-9\n");
+                return 1;
+            }
+        } else if (strncmp(argv[i], "--compression-level=", 20) == 0) {
+            g_comp_level = atoi(argv[i] + 20);
+            if (g_comp_level < 0 || g_comp_level > 9) {
+                fprintf(stderr,
+                    "udpkg: compression level must be 0-9\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-S") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "udpkg: -S requires a strategy name\n");
+                return 1;
+            }
+            i++;
+            if (g_compression == COMP_GZIP) {
+                if (strcmp(argv[i], "filtered") == 0)      g_comp_strat_gz = 1;
+                else if (strcmp(argv[i], "huffman") == 0)  g_comp_strat_gz = 2;
+                else if (strcmp(argv[i], "rle")     == 0)  g_comp_strat_gz = 3;
+                else if (strcmp(argv[i], "fixed")   == 0)  g_comp_strat_gz = 4;
+                else {
+                    fprintf(stderr,
+                        "udpkg: unknown gzip strategy '%s'"
+                        " (use: filtered, huffman, rle, fixed)\n", argv[i]);
+                    return 1;
+                }
+            } else if (g_compression == COMP_XZ) {
+                if (strcmp(argv[i], "none")    == 0)     g_comp_strat_xz = 0;
+                else if (strcmp(argv[i], "extreme") == 0) g_comp_strat_xz = 1;
+                else {
+                    fprintf(stderr,
+                        "udpkg: unknown xz strategy '%s'"
+                        " (use: none, extreme)\n", argv[i]);
+                    return 1;
+                }
+            } else {
+                fprintf(stderr,
+                    "udpkg: -S is only supported with gzip or xz compression\n");
+                return 1;
+            }
+        } else if (strncmp(argv[i], "--compression-strategy=", 23) == 0) {
+            const char *val = argv[i] + 23;
+            if (g_compression == COMP_GZIP) {
+                if (strcmp(val, "filtered") == 0)      g_comp_strat_gz = 1;
+                else if (strcmp(val, "huffman") == 0)  g_comp_strat_gz = 2;
+                else if (strcmp(val, "rle")     == 0)  g_comp_strat_gz = 3;
+                else if (strcmp(val, "fixed")   == 0)  g_comp_strat_gz = 4;
+                else {
+                    fprintf(stderr,
+                        "udpkg: unknown gzip strategy '%s'"
+                        " (use: filtered, huffman, rle, fixed)\n", val);
+                    return 1;
+                }
+            } else if (g_compression == COMP_XZ) {
+                if (strcmp(val, "none")    == 0)     g_comp_strat_xz = 0;
+                else if (strcmp(val, "extreme") == 0) g_comp_strat_xz = 1;
+                else {
+                    fprintf(stderr,
+                        "udpkg: unknown xz strategy '%s'"
+                        " (use: none, extreme)\n", val);
+                    return 1;
+                }
+            } else {
+                fprintf(stderr,
+                    "udpkg: --compression-strategy is only supported"
+                    " with gzip or xz\n");
+                return 1;
+            }
+        } else if (strncmp(argv[i], "--abort-after=", 14) == 0) {
+            g_abort_after = atoi(argv[i] + 14);
+            if (g_abort_after <= 0) {
+                fprintf(stderr,
+                    "udpkg: --abort-after requires a positive integer\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "--force-all") == 0) {
             g_force_chrootless    = 1;
             g_force_deps          = 1;
@@ -1452,6 +1968,37 @@ int main(int argc, char *argv[]) {
         log_close();
         return rc == 0 ? 0 : 1;
     }
+    if (strcmp(fwd[1], "-b") == 0) {
+        if (nfwd < 3) {
+            fprintf(stderr, "udpkg: -b requires a source directory\n");
+            log_close();
+            return 1;
+        }
+        ret = op_build(fwd[2], nfwd > 3 ? fwd[3] : NULL);
+        log_close();
+        return ret == 0 ? 0 : 1;
+    }
+    if (strcmp(fwd[1], "-e") == 0) {
+        if (nfwd < 4) {
+            fprintf(stderr, "udpkg: -e requires <pkg.deb> <dir>\n");
+            log_close();
+            return 1;
+        }
+        ret = op_extract_control(fwd[2], fwd[3]);
+        log_close();
+        return ret == 0 ? 0 : 1;
+    }
+    if (strncmp(fwd[1], "--showformat=", 13) == 0) {
+        const char *debpath = fwd[1] + 13;
+        if (debpath[0] == '\0') {
+            fprintf(stderr, "udpkg: --showformat= requires a package file\n");
+            log_close();
+            return 1;
+        }
+        ret = op_show(debpath);
+        log_close();
+        return ret == 0 ? 0 : 1;
+    }
     db_set_root(g_root);
     if (admindir_arg[0])
         db_set_admindir(admindir_arg);
@@ -1508,8 +2055,18 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         for (i = 2; i < nfwd; i++) {
-            if (op_remove(fwd[i]) != 0)
+            if (op_remove(fwd[i]) != 0) {
                 ret = 1;
+                if (g_abort_after > 0) {
+                    nerr++;
+                    if (nerr >= g_abort_after) {
+                        fprintf(stderr,
+                            "udpkg: abort-after limit (%d) reached\n",
+                            g_abort_after);
+                        break;
+                    }
+                }
+            }
         }
         if (!g_simulate)
             lock_release();
@@ -1526,9 +2083,22 @@ int main(int argc, char *argv[]) {
             log_close();
             return 1;
         }
-        for (i = 2; i < nfwd; i++) {
-            if (op_purge(fwd[i]) != 0)
-                ret = 1;
+        {
+            int nerr2 = 0;
+            for (i = 2; i < nfwd; i++) {
+                if (op_purge(fwd[i]) != 0) {
+                    ret = 1;
+                    if (g_abort_after > 0) {
+                        nerr2++;
+                        if (nerr2 >= g_abort_after) {
+                            fprintf(stderr,
+                                "udpkg: abort-after limit (%d) reached\n",
+                                g_abort_after);
+                            break;
+                        }
+                    }
+                }
+            }
         }
         if (!g_simulate)
             lock_release();
