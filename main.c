@@ -12,6 +12,7 @@
 #include "ar.h"
 #include "ctrl.h"
 #include "db.h"
+#include "deb_fmt.h"
 #include "dep.h"
 #include "lock.h"
 #include "log.h"
@@ -22,14 +23,15 @@ extern int chroot(const char *);
 #define MISS_MAX       DEP_MISS_MAX
 #define IGNORE_DEP_MAX 64
 
-static char g_root[4096]       = "";
-static char g_instdir[4096]    = "";
+static char g_root[4096]          = "";
+static char g_instdir[4096]       = "";
 static int  g_force_chrootless    = 0;
 static int  g_force_deps          = 0;
 static int  g_force_not_root      = 0;
 static int  g_force_overwrite     = 0;
 static int  g_force_overwrite_dir = 0;
-static int  g_simulate         = 0;
+static int  g_simulate            = 0;
+static int  g_format              = DEB_FMT_AUTO;
 
 static const char *g_ignore_dep[IGNORE_DEP_MAX];
 static int         g_nignore_dep = 0;
@@ -294,29 +296,16 @@ static int read_ctrl_from_deb(const char *debpath, ctrl_t *ctrl) {
     char ctrl_tar[256];
     char ctrl_dir[256];
     char ctrl_file[512];
-    ar_entry_t entry;
-    int arfd, ret, have_ctrl = 0;
+    int used_fmt, ret;
     struct stat st;
     strncpy(tmpscan, "/tmp/udpkg_scan_XXXXXX", sizeof(tmpscan) - 1);
     tmpscan[sizeof(tmpscan) - 1] = '\0';
     if (!mkdtemp(tmpscan))
         return -1;
-    memset(&entry, 0, sizeof(entry));
-    arfd = ar_open(debpath);
-    if (arfd < 0) {
-        cleanup_dir(tmpscan);
-        return -1;
-    }
-    while ((ret = ar_next(arfd, &entry)) == 1) {
-        if (strncmp(entry.name, "control.tar", 11) == 0) {
-            snprintf(ctrl_tar, sizeof(ctrl_tar), "%s/%s", tmpscan, entry.name);
-            ar_extract(arfd, &entry, ctrl_tar);
-            have_ctrl = 1;
-            break;
-        }
-    }
-    close(arfd);
-    if (!have_ctrl) {
+    if (deb_open(debpath, g_format, tmpscan,
+                 ctrl_tar, sizeof(ctrl_tar), NULL,
+                 NULL, 0,
+                 1, 0, &used_fmt) != 0) {
         cleanup_dir(tmpscan);
         return -1;
     }
@@ -334,8 +323,14 @@ static int read_ctrl_from_deb(const char *debpath, ctrl_t *ctrl) {
     }
     snprintf(ctrl_file, sizeof(ctrl_file), "%s/control", ctrl_dir);
     if (stat(ctrl_file, &st) != 0) {
-        cleanup_dir(tmpscan);
-        return -1;
+        char ctrl_file2[512];
+        snprintf(ctrl_file2, sizeof(ctrl_file2), "%s/DEBIAN/control", ctrl_dir);
+        if (stat(ctrl_file2, &st) != 0) {
+            cleanup_dir(tmpscan);
+            return -1;
+        }
+        strncpy(ctrl_file, ctrl_file2, sizeof(ctrl_file) - 1);
+        ctrl_file[sizeof(ctrl_file) - 1] = '\0';
     }
     ret = ctrl_parse(ctrl_file, ctrl);
     cleanup_dir(tmpscan);
@@ -346,13 +341,10 @@ static int op_info(const char *debpath) {
     char tmpscan[64];
     char ctrl_tar[256];
     char ctrl_dir[256];
-    ar_entry_t entry;
-    int arfd, ret;
-    int have_ctrl = 0;
     size_t ctrl_archive_size = 0;
     struct stat deb_st;
     ctrl_t ctrl;
-    int i;
+    int i, used_fmt;
     if (stat(debpath, &deb_st) != 0) {
         fprintf(stderr, "udpkg: cannot stat '%s': %s\n",
                 debpath, strerror(errno));
@@ -362,29 +354,17 @@ static int op_info(const char *debpath) {
     tmpscan[sizeof(tmpscan) - 1] = '\0';
     if (!mkdtemp(tmpscan))
         return -1;
-    memset(&entry, 0, sizeof(entry));
-    arfd = ar_open(debpath);
-    if (arfd < 0) {
+    if (deb_open(debpath, g_format, tmpscan,
+                 ctrl_tar, sizeof(ctrl_tar), &ctrl_archive_size,
+                 NULL, 0,
+                 1, 0, &used_fmt) != 0) {
         fprintf(stderr, "udpkg: cannot open '%s': not a valid .deb archive\n",
                 debpath);
         cleanup_dir(tmpscan);
         return -1;
     }
-    while ((ret = ar_next(arfd, &entry)) == 1) {
-        if (strncmp(entry.name, "control.tar", 11) == 0) {
-            ctrl_archive_size = entry.size;
-            snprintf(ctrl_tar, sizeof(ctrl_tar), "%s/%s", tmpscan, entry.name);
-            ar_extract(arfd, &entry, ctrl_tar);
-            have_ctrl = 1;
-            break;
-        }
-    }
-    close(arfd);
-    if (!have_ctrl) {
-        fprintf(stderr, "udpkg: malformed .deb: missing control member\n");
-        cleanup_dir(tmpscan);
-        return -1;
-    }
+    log_write("info %s format:%s", debpath,
+              used_fmt == DEB_FMT_OLD ? "old" : "new");
     snprintf(ctrl_dir, sizeof(ctrl_dir), "%s/ctrl", tmpscan);
     if (mkdir(ctrl_dir, 0755) != 0) {
         cleanup_dir(tmpscan);
@@ -400,14 +380,28 @@ static int op_info(const char *debpath) {
     }
     {
         char ctrl_file[512];
+        char ctrl_file2[512];
+        struct stat cst;
         snprintf(ctrl_file, sizeof(ctrl_file), "%s/control", ctrl_dir);
-        if (ctrl_parse(ctrl_file, &ctrl) != 0) {
+        if (stat(ctrl_file, &cst) != 0) {
+            snprintf(ctrl_file2, sizeof(ctrl_file2),
+                     "%s/DEBIAN/control", ctrl_dir);
+            if (stat(ctrl_file2, &cst) != 0 ||
+                ctrl_parse(ctrl_file2, &ctrl) != 0) {
+                fprintf(stderr, "udpkg: cannot parse control file\n");
+                cleanup_dir(tmpscan);
+                return -1;
+            }
+        } else if (ctrl_parse(ctrl_file, &ctrl) != 0) {
             fprintf(stderr, "udpkg: cannot parse control file\n");
             cleanup_dir(tmpscan);
             return -1;
         }
     }
-    printf(" new Debian package, version 2.0.\n");
+    if (used_fmt == DEB_FMT_OLD)
+        printf(" old Debian package, version 0.939000.\n");
+    else
+        printf(" new Debian package, version 2.0.\n");
     printf(" size %lld bytes: control archive=%zu bytes.\n",
            (long long)deb_st.st_size, ctrl_archive_size);
     {
@@ -445,16 +439,14 @@ static int op_install_one(const char *debpath,
     char ctrl_file[4096];
     char raw_list[4096];
     char norm_list[4096];
-    int arfd, ret;
-    int have_ctrl = 0, have_data = 0;
     struct stat st;
     ctrl_t ctrl;
     const char *pkgname, *depends, *arch, *ver;
     dep_list_t dl;
     char missing[MISS_MAX][DEP_MISS_MAX];
     int nmissing = 0;
-    ar_entry_t entry;
     int is_upgrade = 0;
+    int used_fmt = DEB_FMT_AUTO;
     char oldver[256];
     static const char * const mscripts[] =
         { "preinst", "postinst", "prerm", "postrm", NULL };
@@ -465,31 +457,12 @@ static int op_install_one(const char *debpath,
         fprintf(stderr, "udpkg: cannot create %s\n", db_tmpci());
         return -1;
     }
-    memset(&entry, 0, sizeof(entry));
-    arfd = ar_open(debpath);
-    if (arfd < 0) {
+    if (deb_open(debpath, g_format, db_tmpci(),
+                 ctrl_tar, sizeof(ctrl_tar), NULL,
+                 data_tar, sizeof(data_tar),
+                 1, 1, &used_fmt) != 0) {
         fprintf(stderr,
             "udpkg: cannot open '%s': not a valid .deb archive\n", debpath);
-        tmpci_cleanup();
-        return -1;
-    }
-    while ((ret = ar_next(arfd, &entry)) == 1) {
-        if (strncmp(entry.name, "control.tar", 11) == 0) {
-            snprintf(ctrl_tar, sizeof(ctrl_tar),
-                     "%s/%s", db_tmpci(), entry.name);
-            ar_extract(arfd, &entry, ctrl_tar);
-            have_ctrl = 1;
-        } else if (strncmp(entry.name, "data.tar", 8) == 0) {
-            snprintf(data_tar, sizeof(data_tar),
-                     "%s/%s", db_tmpci(), entry.name);
-            ar_extract(arfd, &entry, data_tar);
-            have_data = 1;
-        }
-    }
-    close(arfd);
-    if (!have_ctrl || !have_data) {
-        fprintf(stderr,
-            "udpkg: malformed .deb: missing control or data member\n");
         tmpci_cleanup();
         return -1;
     }
@@ -504,9 +477,16 @@ static int op_install_one(const char *debpath,
     }
     snprintf(ctrl_file, sizeof(ctrl_file), "%s/control", db_tmpci_ctrl());
     if (stat(ctrl_file, &st) != 0) {
-        fprintf(stderr, "udpkg: control file not found in package\n");
-        tmpci_cleanup();
-        return -1;
+        char ctrl_file2[4096];
+        snprintf(ctrl_file2, sizeof(ctrl_file2),
+                 "%s/DEBIAN/control", db_tmpci_ctrl());
+        if (stat(ctrl_file2, &st) != 0) {
+            fprintf(stderr, "udpkg: control file not found in package\n");
+            tmpci_cleanup();
+            return -1;
+        }
+        strncpy(ctrl_file, ctrl_file2, sizeof(ctrl_file) - 1);
+        ctrl_file[sizeof(ctrl_file) - 1] = '\0';
     }
     if (ctrl_parse(ctrl_file, &ctrl) != 0) {
         fprintf(stderr, "udpkg: cannot parse control file\n");
@@ -519,6 +499,8 @@ static int op_install_one(const char *debpath,
         tmpci_cleanup();
         return -1;
     }
+    log_write("format %s %s", pkgname,
+              used_fmt == DEB_FMT_OLD ? "old(0.939000)" : "new(2.0)");
     arch = ctrl_get(&ctrl, "Architecture");
     ver  = ctrl_get(&ctrl, "Version");
     depends = ctrl_get(&ctrl, "Depends");
@@ -835,31 +817,17 @@ static int op_status(const char *name) {
 
 static int extract_data_tar(const char *debpath, char *out_tar, size_t outsz) {
     char tmpdir[64];
-    ar_entry_t entry;
-    int arfd, ret, found = 0;
+    int used_fmt;
     strncpy(tmpdir, "/tmp/udpkg_xtr_XXXXXX", sizeof(tmpdir) - 1);
     tmpdir[sizeof(tmpdir) - 1] = '\0';
     if (!mkdtemp(tmpdir))
         return -1;
-    memset(&entry, 0, sizeof(entry));
-    arfd = ar_open(debpath);
-    if (arfd < 0) {
+    if (deb_open(debpath, g_format, tmpdir,
+                 NULL, 0, NULL,
+                 out_tar, outsz,
+                 0, 1, &used_fmt) != 0) {
         fprintf(stderr, "udpkg: cannot open '%s': not a valid .deb archive\n",
                 debpath);
-        cleanup_dir(tmpdir);
-        return -1;
-    }
-    while ((ret = ar_next(arfd, &entry)) == 1) {
-        if (strncmp(entry.name, "data.tar", 8) == 0) {
-            snprintf(out_tar, outsz, "%s/%s", tmpdir, entry.name);
-            ar_extract(arfd, &entry, out_tar);
-            found = 1;
-            break;
-        }
-    }
-    close(arfd);
-    if (!found) {
-        fprintf(stderr, "udpkg: malformed .deb: missing data member\n");
         cleanup_dir(tmpdir);
         return -1;
     }
@@ -1000,6 +968,7 @@ static void usage(const char *prog) {
         "  --instdir=DIR                  Override installation target directory\n"
         "  --log=FILE                     Log operations to FILE\n"
         "  --ignore-depends=P1[,P2,...]   Ignore dependency on listed packages\n"
+        "  --format=FORMAT                auto|new|old  (default: auto)\n"
         "  --force-script-chrootless      Skip chroot, run scripts on host\n"
         "  --force-not-root               Skip superuser privilege check\n"
         "  --force-overwrite              Allow overwriting files from other packages\n"
@@ -1068,6 +1037,16 @@ int main(int argc, char *argv[]) {
                     g_instdir[--len] = '\0';
                 if (strcmp(g_instdir, "/") == 0)
                     g_instdir[0] = '\0';
+            }
+        } else if (strncmp(argv[i], "--format=", 9) == 0) {
+            const char *val = argv[i] + 9;
+            if (strcmp(val, "new")  == 0)      g_format = DEB_FMT_NEW;
+            else if (strcmp(val, "old") == 0)  g_format = DEB_FMT_OLD;
+            else if (strcmp(val, "auto") == 0) g_format = DEB_FMT_AUTO;
+            else {
+                fprintf(stderr,
+                    "udpkg: unknown format '%s' (use: auto, new, old)\n", val);
+                return 1;
             }
         } else if (strncmp(argv[i], "--log=", 6) == 0) {
             log_open(argv[i] + 6);
