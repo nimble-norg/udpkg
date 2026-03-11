@@ -16,6 +16,7 @@
 #include "dep.h"
 #include "lock.h"
 #include "log.h"
+#include "utar.h"
 
 extern int chroot(const char *);
 
@@ -86,14 +87,18 @@ static int cmd_available(const char *cmd) {
 }
 
 static int check_prereqs(void) {
-    static const char * const required[] = { "tar", "rm", "sh", NULL };
+    static const char * const required_always[] = { "rm", "sh", NULL };
     int i, ok = 1;
-    for (i = 0; required[i]; i++) {
-        if (!cmd_available(required[i])) {
+    for (i = 0; required_always[i]; i++) {
+        if (!cmd_available(required_always[i])) {
             fprintf(stderr, "udpkg: required command not found in PATH: %s\n",
-                    required[i]);
+                    required_always[i]);
             ok = 0;
         }
+    }
+    if (utar_get_impl() == TARIMPL_EXTERNAL && !cmd_available("tar")) {
+        fprintf(stderr, "udpkg: required command not found in PATH: tar\n");
+        ok = 0;
     }
     return ok;
 }
@@ -105,26 +110,6 @@ static int xrun(char *const argv[]) {
     if (pid < 0)
         return -1;
     if (pid == 0) {
-        execvp(argv[0], argv);
-        _exit(127);
-    }
-    if (waitpid(pid, &status, 0) < 0)
-        return -1;
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-}
-
-static int xrun_out(char *const argv[], const char *outfile) {
-    pid_t pid;
-    int status, fd;
-    pid = fork();
-    if (pid < 0)
-        return -1;
-    if (pid == 0) {
-        fd = open(outfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd >= 0) {
-            dup2(fd, STDOUT_FILENO);
-            close(fd);
-        }
         execvp(argv[0], argv);
         _exit(127);
     }
@@ -541,8 +526,7 @@ static int read_ctrl_from_deb(const char *debpath, ctrl_t *ctrl) {
         return -1;
     }
     {
-        char *const argv[] = { "tar", "-C", ctrl_dir, "-xf", ctrl_tar, NULL };
-        if (xrun(argv) != 0) {
+        if (utar_extract(ctrl_tar, ctrl_dir, 0) != 0) {
             cleanup_dir(tmpscan);
             return -1;
         }
@@ -597,8 +581,7 @@ static int op_info(const char *debpath) {
         return -1;
     }
     {
-        char *const argv[] = { "tar", "-C", ctrl_dir, "-xf", ctrl_tar, NULL };
-        if (xrun(argv) != 0) {
+        if (utar_extract(ctrl_tar, ctrl_dir, 0) != 0) {
             fprintf(stderr, "udpkg: failed to extract control archive\n");
             cleanup_dir(tmpscan);
             return -1;
@@ -696,9 +679,7 @@ static int op_install_one(const char *debpath,
         return -1;
     }
     {
-        char *const argv[] =
-            { "tar", "-C", (char *)db_tmpci_ctrl(), "-xf", ctrl_tar, NULL };
-        if (xrun(argv) != 0) {
+        if (utar_extract(ctrl_tar, db_tmpci_ctrl(), 0) != 0) {
             fprintf(stderr, "udpkg: failed to extract control archive\n");
             tmpci_cleanup();
             return -1;
@@ -754,8 +735,9 @@ static int op_install_one(const char *debpath,
             if (g_skip_same_version) {
                 int cmp = ver_cmp_public(ver, inst_ver);
                 if (cmp == 0) {
-                    printf("udpkg: %s: skipping, same version (%s) already installed\n",
-                           pkgname, inst_ver);
+                    fprintf(stderr,
+                        "udpkg: %s: skipping, same version (%s) already installed\n",
+                        pkgname, inst_ver);
                     tmpci_cleanup();
                     return 0;
                 }
@@ -763,8 +745,9 @@ static int op_install_one(const char *debpath,
             if (g_refuse_downgrade) {
                 int cmp = ver_cmp_public(ver, inst_ver);
                 if (cmp < 0) {
-                    printf("udpkg: %s: skipping, would downgrade from %s to %s\n",
-                           pkgname, inst_ver, ver);
+                    fprintf(stderr,
+                        "udpkg: %s: skipping, would downgrade from %s to %s\n",
+                        pkgname, inst_ver, ver);
                     tmpci_cleanup();
                     return 0;
                 }
@@ -805,8 +788,7 @@ static int op_install_one(const char *debpath,
     snprintf(raw_list,  sizeof(raw_list),  "%s/raw.list",  db_tmpci());
     snprintf(norm_list, sizeof(norm_list), "%s/norm.list", db_tmpci());
     {
-        char *const argv[] = { "tar", "-tf", data_tar, NULL };
-        xrun_out(argv, raw_list);
+        utar_list(data_tar, 0, raw_list);
     }
     normalize_filelist(raw_list, norm_list);
     {
@@ -922,9 +904,7 @@ static int op_install_one(const char *debpath,
         if (nconfs > 0)
             conffiles_presave(confs, nconfs, pkgname, is_upgrade);
         {
-            char *const argv[] =
-                { "tar", "-C", instroot, "-xf", data_tar, NULL };
-            if (xrun(argv) != 0) {
+            if (utar_extract(data_tar, instroot, 0) != 0) {
                 fprintf(stderr, "udpkg: failed to extract data archive\n");
                 conffiles_cleanup_tmp(confs, nconfs);
                 tmpci_cleanup();
@@ -975,7 +955,8 @@ static int op_install_batch(char **debpaths, int ndeb, int force) {
     ctrl_t ctrl;
     const char *pkgname;
     int i, ret = 0, nerr = 0;
-    log_write("startup archives install");
+    log_write("startup archives install tar:%s fmt:%s",
+              utar_impl_name(), utar_fmt_name(utar_get_fmt()));
     for (i = 0; i < ndeb && nbatch < BATCH_MAX; i++) {
         if (read_ctrl_from_deb(debpaths[i], &ctrl) == 0) {
             pkgname = ctrl_get(&ctrl, "Package");
@@ -1028,7 +1009,8 @@ static int op_remove(const char *name) {
     db_get_version(name, ver, sizeof(ver));
     if (db_get(name, &c) == 0)
         arch = ctrl_get(&c, "Architecture");
-    log_write("startup archives remove");
+    log_write("startup archives remove tar:%s fmt:%s",
+              utar_impl_name(), utar_fmt_name(utar_get_fmt()));
     log_write("remove %s:%s %s <none>",
               name, arch ? arch : "unknown", ver[0] ? ver : "<none>");
     if (g_simulate) {
@@ -1184,16 +1166,7 @@ static int op_extract(const char *debpath, const char *destdir, int verbose) {
     }
     if (extract_data_tar(debpath, data_tar, sizeof(data_tar)) != 0)
         return -1;
-    {
-        char taropt[8];
-        strncpy(taropt, verbose ? "-xvf" : "-xf", sizeof(taropt) - 1);
-        taropt[sizeof(taropt) - 1] = '\0';
-        {
-            char *const argv[] = { "tar", "-C", (char *)destdir,
-                                   taropt, data_tar, NULL };
-            rc = xrun(argv);
-        }
-    }
+    rc = utar_extract(data_tar, destdir, verbose);
     {
         char tmpdir[4096];
         char *slash = strrchr(data_tar, '/');
@@ -1214,10 +1187,7 @@ static int op_contents(const char *debpath) {
     int rc;
     if (extract_data_tar(debpath, data_tar, sizeof(data_tar)) != 0)
         return -1;
-    {
-        char *const argv[] = { "tar", "-tvf", data_tar, NULL };
-        rc = xrun(argv);
-    }
+    rc = utar_list_stdout(data_tar, 1);
     {
         char tmpdir[4096];
         char *slash = strrchr(data_tar, '/');
@@ -1299,59 +1269,127 @@ static const char *comp_ext(void) {
     }
 }
 
+static int compress_file(const char *inpath, const char *outpath) {
+    const char *comp_cmd = NULL;
+    char level_arg[8]    = "";
+    char extra_arg[16]   = "";
+    char *cargv[10];
+    int ca = 0;
+    pid_t pid;
+    int status, in, out;
+    if (g_compression == COMP_NONE) {
+        char buf[65536];
+        ssize_t n;
+        in = open(inpath, O_RDONLY);
+        if (in < 0) return -1;
+        out = open(outpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (out < 0) { close(in); return -1; }
+        while ((n = read(in, buf, sizeof(buf))) > 0)
+            if (write(out, buf, (size_t)n) != n) { close(in); close(out); return -1; }
+        close(in);
+        close(out);
+        return 0;
+    }
+    switch (g_compression) {
+        case COMP_GZIP: comp_cmd = "gzip"; break;
+        case COMP_XZ:   comp_cmd = "xz";   break;
+        case COMP_ZSTD: comp_cmd = "zstd"; break;
+        default:        return 0;
+    }
+    if (g_comp_level >= 0)
+        snprintf(level_arg, sizeof(level_arg), "-%d", g_comp_level);
+    if (g_compression == COMP_XZ && g_comp_strat_xz == 1)
+        strncpy(extra_arg, "--extreme", sizeof(extra_arg) - 1);
+    in  = open(inpath,  O_RDONLY);
+    if (in < 0) return -1;
+    out = open(outpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out < 0) { close(in); return -1; }
+    cargv[ca++] = (char *)comp_cmd;
+    if (level_arg[0]) cargv[ca++] = level_arg;
+    if (extra_arg[0]) cargv[ca++] = extra_arg;
+    cargv[ca++] = "-c";
+    cargv[ca]   = NULL;
+    pid = fork();
+    if (pid < 0) { close(in); close(out); return -1; }
+    if (pid == 0) {
+        dup2(in, STDIN_FILENO);
+        dup2(out, STDOUT_FILENO);
+        close(in); close(out);
+        execvp(cargv[0], cargv);
+        _exit(127);
+    }
+    close(in); close(out);
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
 static int build_tar(const char *srcdir, const char *exclude,
                      const char *outpath) {
-    const char *flag = comp_tar_flag();
-    char prog_buf[128];
-    char *argv[24];
-    int n = 0;
-    int use_prog = 0;
-    prog_buf[0] = '\0';
-    if (g_compression == COMP_GZIP) {
-        if (g_comp_level >= 0) {
-            snprintf(prog_buf, sizeof(prog_buf), "gzip -%d", g_comp_level);
-            use_prog = 1;
+    if (utar_get_impl() == TARIMPL_EXTERNAL) {
+        const char *flag = comp_tar_flag();
+        char prog_buf[128];
+        char *argv[24];
+        int n = 0;
+        int use_prog = 0;
+        prog_buf[0] = '\0';
+        if (g_compression == COMP_GZIP) {
+            if (g_comp_level >= 0) {
+                snprintf(prog_buf, sizeof(prog_buf), "gzip -%d", g_comp_level);
+                use_prog = 1;
+            }
+        } else if (g_compression == COMP_XZ) {
+            if (g_comp_level >= 0 || g_comp_strat_xz == 1) {
+                int pos = 0;
+                pos += snprintf(prog_buf + pos, sizeof(prog_buf) - (size_t)pos, "xz");
+                if (g_comp_level >= 0)
+                    pos += snprintf(prog_buf + pos, sizeof(prog_buf) - (size_t)pos,
+                                    " -%d", g_comp_level);
+                if (g_comp_strat_xz == 1)
+                    pos += snprintf(prog_buf + pos, sizeof(prog_buf) - (size_t)pos,
+                                    " --extreme");
+                use_prog = 1;
+                (void)pos;
+            }
+        } else if (g_compression == COMP_ZSTD) {
+            if (g_comp_level >= 0) {
+                snprintf(prog_buf, sizeof(prog_buf), "zstd -%d", g_comp_level);
+                use_prog = 1;
+            }
         }
-    } else if (g_compression == COMP_XZ) {
-        if (g_comp_level >= 0 || g_comp_strat_xz == 1) {
-            int pos = 0;
-            pos += snprintf(prog_buf + pos, sizeof(prog_buf) - (size_t)pos,
-                            "xz");
-            if (g_comp_level >= 0)
-                pos += snprintf(prog_buf + pos, sizeof(prog_buf) - (size_t)pos,
-                                " -%d", g_comp_level);
-            if (g_comp_strat_xz == 1)
-                pos += snprintf(prog_buf + pos, sizeof(prog_buf) - (size_t)pos,
-                                " --extreme");
-            use_prog = 1;
-            (void)pos;
+        argv[n++] = "tar";
+        argv[n++] = "-C";
+        argv[n++] = (char *)srcdir;
+        if (g_verbose) argv[n++] = "-v";
+        if (use_prog) {
+            argv[n++] = "-I";
+            argv[n++] = prog_buf;
+        } else if (flag) {
+            argv[n++] = (char *)flag;
         }
-    } else if (g_compression == COMP_ZSTD) {
-        if (g_comp_level >= 0) {
-            snprintf(prog_buf, sizeof(prog_buf), "zstd -%d", g_comp_level);
-            use_prog = 1;
+        argv[n++] = "-cf";
+        argv[n++] = (char *)outpath;
+        if (exclude) {
+            argv[n++] = "--exclude";
+            argv[n++] = (char *)exclude;
         }
+        argv[n++] = ".";
+        argv[n]   = NULL;
+        return xrun(argv);
     }
-    argv[n++] = "tar";
-    argv[n++] = "-C";
-    argv[n++] = (char *)srcdir;
-    if (g_verbose)
-        argv[n++] = "-v";
-    if (use_prog) {
-        argv[n++] = "-I";
-        argv[n++] = prog_buf;
-    } else if (flag) {
-        argv[n++] = (char *)flag;
+    {
+        char tmp_raw[4096];
+        int rc;
+        snprintf(tmp_raw, sizeof(tmp_raw), "%s.tmp_raw", outpath);
+        rc = utar_create(tmp_raw, srcdir, exclude, g_verbose);
+        if (rc != 0) return rc;
+        if (g_compression == COMP_NONE) {
+            if (rename(tmp_raw, outpath) != 0) { unlink(tmp_raw); return -1; }
+            return 0;
+        }
+        rc = compress_file(tmp_raw, outpath);
+        unlink(tmp_raw);
+        return rc;
     }
-    argv[n++] = "-cf";
-    argv[n++] = (char *)outpath;
-    if (exclude) {
-        argv[n++] = "--exclude";
-        argv[n++] = (char *)exclude;
-    }
-    argv[n++] = ".";
-    argv[n]   = NULL;
-    return xrun(argv);
 }
 
 static int op_extract_control(const char *debpath, const char *outdir) {
@@ -1359,10 +1397,6 @@ static int op_extract_control(const char *debpath, const char *outdir) {
     char ctrl_tar[4096];
     struct stat st;
     int used_fmt;
-    if (!g_no_check && !cmd_available("tar")) {
-        fprintf(stderr, "udpkg: required command not found in PATH: tar\n");
-        return -1;
-    }
     strncpy(tmpdir, "/tmp/udpkg_ce_XXXXXX", sizeof(tmpdir) - 1);
     tmpdir[sizeof(tmpdir) - 1] = '\0';
     if (!mkdtemp(tmpdir)) {
@@ -1386,9 +1420,7 @@ static int op_extract_control(const char *debpath, const char *outdir) {
         }
     }
     {
-        char *const argv[] =
-            { "tar", "-xf", ctrl_tar, "-C", (char *)outdir, NULL };
-        if (xrun(argv) != 0) {
+        if (utar_extract(ctrl_tar, outdir, 0) != 0) {
             fprintf(stderr, "udpkg: failed to extract control archive\n");
             cleanup_dir(tmpdir);
             return -1;
@@ -1479,7 +1511,8 @@ static int op_build(const char *srcdir, const char *outarg) {
     char outpath[4096];
     struct stat st;
     int arfd, rc = 0;
-    if (!g_no_check && !cmd_available("tar")) {
+    if (!g_no_check && utar_get_impl() == TARIMPL_EXTERNAL
+        && !cmd_available("tar")) {
         fprintf(stderr, "udpkg: required command not found in PATH: tar\n");
         return -1;
     }
@@ -1578,6 +1611,12 @@ static int op_build(const char *srcdir, const char *outarg) {
             pkgname = ctrl_get(&c, "Package");
         printf("dpkg-deb: building package '%s' in '%s'\n",
                pkgname ? pkgname : "?", outpath);
+        log_write("build %s %s tar:%s fmt:%s compression:%s",
+                  pkgname ? pkgname : "?", outpath,
+                  utar_impl_name(), utar_fmt_name(utar_get_fmt()),
+                  g_compression == COMP_XZ   ? "xz"   :
+                  g_compression == COMP_ZSTD ? "zstd" :
+                  g_compression == COMP_NONE ? "none" : "gzip");
     }
     return rc;
 }
@@ -1635,6 +1674,11 @@ static void usage(const char *prog) {
         "  -G, --refuse-downgrade         Skip install if it would downgrade the package\n"
         "  --no-check, --nocheck          Skip PATH tool availability checks\n"
         "  --abort-after=<n>              Abort batch operation after <n> errors\n"
+        "  -T internal|external           Tar implementation (default: internal)\n"
+        "  --tar-implementation=...       Same as -T\n"
+        "  -t auto|gnu|pax|ustar|v7       Tar format (default: auto)\n"
+        "  --tar-format=...               Same as -t\n"
+        "                                 Note: --build defaults to pax when auto\n"
         "  --force-all                    Enable all --force-* options\n",
         prog);
 }
@@ -1783,6 +1827,68 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--no-check") == 0
                    || strcmp(argv[i], "--nocheck") == 0) {
             g_no_check = 1;
+        } else if (strcmp(argv[i], "-T") == 0
+                   || strcmp(argv[i], "--tar-implementation") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "udpkg: %s requires an argument\n", argv[i]);
+                return 1;
+            }
+            i++;
+            if (strcmp(argv[i], "internal") == 0)
+                utar_set_impl(TARIMPL_INTERNAL);
+            else if (strcmp(argv[i], "external") == 0)
+                utar_set_impl(TARIMPL_EXTERNAL);
+            else {
+                fprintf(stderr,
+                    "udpkg: unknown tar implementation '%s'"
+                    " (use: internal, external)\n", argv[i]);
+                return 1;
+            }
+        } else if (strncmp(argv[i], "--tar-implementation=", 21) == 0) {
+            const char *val = argv[i] + 21;
+            if (strcmp(val, "internal") == 0)
+                utar_set_impl(TARIMPL_INTERNAL);
+            else if (strcmp(val, "external") == 0)
+                utar_set_impl(TARIMPL_EXTERNAL);
+            else {
+                fprintf(stderr,
+                    "udpkg: unknown tar implementation '%s'"
+                    " (use: internal, external)\n", val);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-t") == 0
+                   || strcmp(argv[i], "--tar-format") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "udpkg: %s requires an argument\n", argv[i]);
+                return 1;
+            }
+            i++;
+            if (strcmp(argv[i], "auto")  == 0) utar_set_fmt(TARFMT_AUTO);
+            else if (strcmp(argv[i], "gnu")   == 0 ||
+                     strcmp(argv[i], "posix") == 0) utar_set_fmt(TARFMT_POSIX);
+            else if (strcmp(argv[i], "ustar") == 0) utar_set_fmt(TARFMT_USTAR);
+            else if (strcmp(argv[i], "pax")   == 0) utar_set_fmt(TARFMT_PAX);
+            else if (strcmp(argv[i], "v7")    == 0) utar_set_fmt(TARFMT_V7);
+            else {
+                fprintf(stderr,
+                    "udpkg: unknown tar format '%s'"
+                    " (use: auto, gnu, pax, ustar, v7)\n", argv[i]);
+                return 1;
+            }
+        } else if (strncmp(argv[i], "--tar-format=", 13) == 0) {
+            const char *val = argv[i] + 13;
+            if (strcmp(val, "auto")  == 0) utar_set_fmt(TARFMT_AUTO);
+            else if (strcmp(val, "gnu")   == 0 ||
+                     strcmp(val, "posix") == 0) utar_set_fmt(TARFMT_POSIX);
+            else if (strcmp(val, "ustar") == 0) utar_set_fmt(TARFMT_USTAR);
+            else if (strcmp(val, "pax")   == 0) utar_set_fmt(TARFMT_PAX);
+            else if (strcmp(val, "v7")    == 0) utar_set_fmt(TARFMT_V7);
+            else {
+                fprintf(stderr,
+                    "udpkg: unknown tar format '%s'"
+                    " (use: auto, gnu, pax, ustar, v7)\n", val);
+                return 1;
+            }
         } else if (strcmp(argv[i], "-v") == 0
                    || strcmp(argv[i], "--verbose") == 0) {
             g_verbose = 1;

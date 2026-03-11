@@ -1,7 +1,7 @@
 CC     = cc
 CFLAGS = -std=c99 -Wall -Wextra -pedantic -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700
 TARGET = udpkg
-OBJS   = ar.o ctrl.o db.o deb_fmt.o dep.o lock.o log.o main.o
+OBJS   = ar.o ctrl.o db.o deb_fmt.o dep.o lock.o log.o tar_impl.o utar.o main.o
 
 all: $(TARGET)
 
@@ -29,7 +29,13 @@ lock.o: lock.c lock.h
 log.o: log.c log.h
 	$(CC) $(CFLAGS) -c log.c
 
-main.o: main.c ar.h ctrl.h db.h deb_fmt.h dep.h lock.h log.h
+tar_impl.o: tar_impl.c tar_impl.h
+	$(CC) $(CFLAGS) -c tar_impl.c
+
+utar.o: utar.c utar.h tar_impl.h
+	$(CC) $(CFLAGS) -c utar.c
+
+main.o: main.c ar.h ctrl.h db.h deb_fmt.h dep.h lock.h log.h utar.h
 	$(CC) $(CFLAGS) -c main.c
 
 clean:
