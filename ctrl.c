@@ -87,3 +87,85 @@ const char *ctrl_get(const ctrl_t *c, const char *key) {
     }
     return NULL;
 }
+
+static void diag_add(ctrl_diags_t *d, int severity,
+                     const char *field, int line, const char *msg)
+{
+    ctrl_diag_t *item;
+    if (!d || d->ndiags >= CTRL_DIAG_MAX)
+        return;
+    item = &d->items[d->ndiags++];
+    item->severity = severity;
+    strncpy(item->field, field, CTRL_KEY_MAX - 1);
+    item->field[CTRL_KEY_MAX - 1] = '\0';
+    item->line = line;
+    strncpy(item->msg, msg, sizeof(item->msg) - 1);
+    item->msg[sizeof(item->msg) - 1] = '\0';
+}
+
+static int field_line(const ctrl_t *c, const char *key)
+{
+    int i, line = 1;
+    for (i = 0; i < c->nfields; i++) {
+        if (strcasecmp(c->fields[i].key, key) == 0)
+            return line;
+        line++;
+    }
+    return -1;
+}
+
+static int is_blank(const char *s)
+{
+    if (!s || *s == '\0')
+        return 1;
+    while (*s) {
+        if (*s != ' ' && *s != '\t' && *s != '\n' && *s != '\r')
+            return 0;
+        s++;
+    }
+    return 1;
+}
+
+void ctrl_validate(const ctrl_t *c, ctrl_diags_t *d)
+{
+    static const char *required[] = {
+        "Package", "Version", "Architecture", NULL
+    };
+    static const char *recommended[] = {
+        "Maintainer", "Description", NULL
+    };
+    int i;
+    const char *val;
+    char msg[256];
+    int ln;
+
+    d->ndiags = 0;
+
+    for (i = 0; required[i]; i++) {
+        val = ctrl_get(c, required[i]);
+        if (!val) {
+            snprintf(msg, sizeof(msg),
+                     "required field '%s' is missing", required[i]);
+            diag_add(d, CTRL_VALID_FATAL, required[i], -1, msg);
+        } else if (is_blank(val)) {
+            ln = field_line(c, required[i]);
+            snprintf(msg, sizeof(msg),
+                     "required field '%s' has empty value", required[i]);
+            diag_add(d, CTRL_VALID_FATAL, required[i], ln, msg);
+        }
+    }
+
+    for (i = 0; recommended[i]; i++) {
+        val = ctrl_get(c, recommended[i]);
+        if (!val) {
+            snprintf(msg, sizeof(msg),
+                     "recommended field '%s' is missing", recommended[i]);
+            diag_add(d, CTRL_VALID_WARN, recommended[i], -1, msg);
+        } else if (is_blank(val)) {
+            ln = field_line(c, recommended[i]);
+            snprintf(msg, sizeof(msg),
+                     "recommended field '%s' has empty value", recommended[i]);
+            diag_add(d, CTRL_VALID_WARN, recommended[i], ln, msg);
+        }
+    }
+}

@@ -15,8 +15,27 @@ typedef struct {
     int          nfields;
 } ctrl_t;
 
+#define CTRL_VALID_OK      0
+#define CTRL_VALID_WARN    1
+#define CTRL_VALID_FATAL   2
+
+typedef struct {
+    int         severity;
+    char        field[CTRL_KEY_MAX];
+    int         line;
+    char        msg[256];
+} ctrl_diag_t;
+
+#define CTRL_DIAG_MAX 32
+
+typedef struct {
+    ctrl_diag_t items[CTRL_DIAG_MAX];
+    int         ndiags;
+} ctrl_diags_t;
+
 int         ctrl_parse(const char *path, ctrl_t *c);
 int         ctrl_parse_str(const char *str, ctrl_t *c);
 const char *ctrl_get(const ctrl_t *c, const char *key);
+void        ctrl_validate(const ctrl_t *c, ctrl_diags_t *d);
 
 #endif

@@ -188,21 +188,51 @@ static void status_free(block_node_t *head) {
     }
 }
 
-static int status_write(block_node_t *head) {
+static int copy_file(const char *src, const char *dst) {
+    char buf[4096];
+    FILE *fs, *fd;
+    size_t nr;
+    fs = fopen(src, "r");
+    if (!fs)
+        return -1;
+    fd = fopen(dst, "w");
+    if (!fd) {
+        fclose(fs);
+        return -1;
+    }
+    while ((nr = fread(buf, 1, sizeof(buf), fs)) > 0)
+        fwrite(buf, 1, nr, fd);
+    fclose(fs);
+    fclose(fd);
+    return 0;
+}
+
+static int status_write_ex(block_node_t *head, int backup) {
     char path[4096];
-    char tmp[8192];
+    char path_new[4096];
+    char path_old[4096];
     FILE *fp;
     block_node_t *n;
-    apath(path, sizeof(path), "/status");
-    snprintf(tmp, sizeof(tmp)-4, "%s", path);
-    strcat(tmp, ".tmp");
-    fp = fopen(tmp, "w");
+    struct stat st;
+    apath(path,     sizeof(path),     "/status");
+    apath(path_new, sizeof(path_new), "/status-new");
+    apath(path_old, sizeof(path_old), "/status-old");
+    fp = fopen(path_new, "w");
     if (!fp)
         return -1;
     for (n = head; n; n = n->next)
         fprintf(fp, "%s\n\n", n->text);
     fclose(fp);
-    return rename(tmp, path);
+    if (backup && stat(path, &st) == 0)
+        copy_file(path, path_old);
+    if (rename(path_new, path) != 0) {
+        unlink(path_new);
+        return -1;
+    }
+    return 0;
+}
+static int status_write(block_node_t *head) {
+    return status_write_ex(head, 1);
 }
 
 int db_init(void) {
@@ -235,6 +265,7 @@ int db_install(const ctrl_t *c, const char *listfile) {
     const char *name;
     block_node_t *list;
     block_node_t *node;
+    block_node_t *prev, *cur, *nxt;
     char dst[8192];
     char buf[8192];
     size_t nr;
@@ -243,7 +274,6 @@ int db_install(const ctrl_t *c, const char *listfile) {
     name = ctrl_get(c, "Package");
     if (!name)
         return -1;
-    db_remove(name);
     elen += (size_t)snprintf(entry + elen, sizeof(entry) - elen,
         "Package: %s\n", name);
     elen += (size_t)snprintf(entry + elen, sizeof(entry) - elen,
@@ -260,6 +290,18 @@ int db_install(const ctrl_t *c, const char *listfile) {
         elen--;
     entry[elen] = '\0';
     list = status_read();
+    prev = NULL; cur = list;
+    while (cur) {
+        nxt = cur->next;
+        if (strcmp(cur->name, name) == 0) {
+            if (prev) prev->next = nxt;
+            else      list = nxt;
+            free(cur);
+        } else {
+            prev = cur;
+        }
+        cur = nxt;
+    }
     node = calloc(1, sizeof(*node));
     if (!node) {
         status_free(list);
@@ -317,7 +359,7 @@ int db_remove(const char *name) {
         cur = next;
     }
     if (found)
-        status_write(list);
+        status_write_ex(list, 0);
     status_free(list);
     snprintf(path, sizeof(path), "%s/%s.list", info_dir, name);
     unlink(path);
@@ -365,27 +407,76 @@ int db_get_version(const char *name, char *buf, size_t bufsz) {
     return 0;
 }
 
-int db_list(const char *pattern) {
+static const char *find_pager(void) {
+    static const char *candidates[] = { "less", "more", NULL };
+    static char found[64];
+    const char *path_env;
+    char *path_copy;
+    char *dir;
+    char full[512];
+    struct stat st;
+    int i;
+    path_env = getenv("PATH");
+    if (!path_env)
+        return NULL;
+    for (i = 0; candidates[i]; i++) {
+        path_copy = strdup(path_env);
+        if (!path_copy)
+            continue;
+        dir = strtok(path_copy, ":");
+        while (dir) {
+            snprintf(full, sizeof(full), "%s/%s", dir, candidates[i]);
+            if (stat(full, &st) == 0 && (st.st_mode & S_IXUSR)) {
+                strncpy(found, candidates[i], sizeof(found) - 1);
+                found[sizeof(found) - 1] = '\0';
+                free(path_copy);
+                return found;
+            }
+            dir = strtok(NULL, ":");
+        }
+        free(path_copy);
+    }
+    return NULL;
+}
+
+int db_list(const char *pattern, int no_pager) {
     block_node_t *list = status_read();
     block_node_t *n;
     ctrl_t c;
     const char *ver, *arch, *desc;
     char descbuf[80];
     int any = 0;
+    FILE *out;
+    const char *pager;
+    int use_pager;
     for (n = list; n; n = n->next) {
         if (pattern && fnmatch(pattern, n->name, 0) != 0)
             continue;
         any = 1;
         break;
     }
+    pager = NULL;
+    use_pager = 0;
+    if (!no_pager && isatty(STDOUT_FILENO)) {
+        pager = find_pager();
+        if (pager)
+            use_pager = 1;
+    }
+    if (use_pager) {
+        out = popen(pager, "w");
+        if (!out)
+            use_pager = 0;
+    }
+    if (!use_pager)
+        out = stdout;
     if (any || !pattern) {
-        printf("Desired=Unknown/Install/Remove/Purge/Hold\n");
-        printf("| Status=Not/Inst/Conf-files/Unpacked/halF-conf/Half-inst/"
+        fprintf(out, "Desired=Unknown/Install/Remove/Purge/Hold\n");
+        fprintf(out, "| Status=Not/Inst/Conf-files/Unpacked/halF-conf/Half-inst/"
                "trig-aWait/Trig-pend\n");
-        printf("|/ Err?=(none)/Reinst-required (Status,Err: uppercase=bad)\n");
-        printf("||/ %-28s %-20s %-12s %s\n",
+        fprintf(out, "|/ Err?=(none)/Reinst-required (Status,Err: uppercase=bad)\n");
+        fprintf(out, "||/ %-28s %-20s %-12s %s\n",
             "Name", "Version", "Architecture", "Description");
-        printf("+++-%-28s-%-20s-%-12s-%s\n",
+        fprintf(out, "+++-%-28s-%-20s-%-12s-%s\n",
             "============================",
             "====================",
             "============",
@@ -409,12 +500,14 @@ int db_list(const char *pattern) {
                     *nl = '\0';
             }
         }
-        printf("ii  %-28s %-20s %-12s %s\n",
+        fprintf(out, "ii  %-28s %-20s %-12s %s\n",
             n->name,
             ver  ? ver  : "(unknown)",
             arch ? arch : "?",
             descbuf);
     }
+    if (use_pager)
+        pclose(out);
     status_free(list);
     return 0;
 }
