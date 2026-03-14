@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <dirent.h>
+#include <fnmatch.h>
 #include <errno.h>
 #include "ar.h"
 #include "ctrl.h"
@@ -55,6 +56,7 @@ static int  g_simulate            = 0;
 static int  g_format              = DEB_FMT_AUTO;
 static int  g_no_pager            = 0;
 static int  g_no_triggers         = 0;
+static int  g_robot               = 0;
 
 static const char *g_ignore_dep[IGNORE_DEP_MAX];
 static int         g_nignore_dep = 0;
@@ -648,11 +650,21 @@ static int op_info(const char *debpath) {
 static int run_triggered_postinst(const char *pkg, const char *trigname) {
     char script_path[4096];
     struct stat st;
+    int sc;
     db_get_scriptpath(pkg, "postinst", script_path, sizeof(script_path));
     if (stat(script_path, &st) != 0 || !(st.st_mode & S_IXUSR))
         return 0;
+    db_set_state(pkg, "install", "ok", "triggers-pending");
+    sn_status(pkg, "", "triggers-pending");
     printf("Processing triggers for %s ...\n", pkg);
-    return run_script(script_path, "triggered", trigname);
+    sc = run_script(script_path, "triggered", trigname);
+    if (sc == 0) {
+        db_set_state(pkg, "install", "ok", "installed");
+        sn_status(pkg, "", "installed");
+    } else {
+        db_set_state(pkg, "install", "reinstreq", "triggers-pending");
+    }
+    return sc;
 }
 
 static int op_install_one(const char *debpath,
@@ -948,6 +960,7 @@ static int op_install_one(const char *debpath,
         if (stat(script_path, &st) == 0 && (st.st_mode & S_IXUSR)) {
             int sc;
             sn_status(pkgname, ver ? ver : "", "half-installed");
+            db_set_state(pkgname, "install", "ok", "half-installed");
             if (is_upgrade)
                 sc = run_script(script_path, "upgrade",
                                 oldver[0] ? oldver : NULL);
@@ -956,6 +969,7 @@ static int op_install_one(const char *debpath,
             if (sc != 0) {
                 fprintf(stderr,
                     "udpkg: subprocess preinst returned error code %d\n", sc);
+                db_set_state(pkgname, "install", "reinstreq", "half-installed");
                 tmpci_cleanup();
                 return -1;
             }
@@ -1017,12 +1031,25 @@ static int op_install_one(const char *debpath,
         if (stat(script_path, &st) == 0 && (st.st_mode & S_IXUSR)) {
             int sc = run_script(script_path, "configure",
                                 is_upgrade && oldver[0] ? oldver : NULL);
-            if (sc != 0)
+            if (sc != 0) {
                 fprintf(stderr,
                     "udpkg: subprocess postinst returned error code %d\n",
                     sc);
+                db_set_state(pkgname, "install", "reinstreq", "half-configured");
+                sn_status(pkgname, ver ? ver : "", "installed");
+                if (!g_no_triggers)
+                    trig_pending_run(run_triggered_postinst);
+                log_write("%s %s:%s %s %s (postinst failed)",
+                          is_upgrade ? "update" : "install",
+                          pkgname, arch ? arch : "unknown",
+                          is_upgrade && oldver[0] ? oldver : "<none>",
+                          ver ? ver : "<none>");
+                tmpci_cleanup();
+                return -1;
+            }
         }
     }
+    db_set_state(pkgname, "install", "ok", "installed");
     sn_status(pkgname, ver ? ver : "", "installed");
     if (!g_no_triggers)
         trig_pending_run(run_triggered_postinst);
@@ -1033,6 +1060,348 @@ static int op_install_one(const char *debpath,
               ver ? ver : "<none>");
     tmpci_cleanup();
     return 0;
+}
+
+
+static int op_unpack_one(const char *debpath,
+                          const char * const *batch, int nbatch,
+                          int force) {
+    char ctrl_tar[4096];
+    char data_tar[4096];
+    char ctrl_file[4096];
+    char raw_list[4096];
+    char norm_list[4096];
+    char conffiles_src[4096];
+    conf_entry_t confs[CONFFILE_MAX];
+    int nconfs = 0;
+    struct stat st;
+    ctrl_t ctrl;
+    const char *pkgname, *depends, *arch, *ver;
+    dep_list_t dl;
+    char missing[MISS_MAX][DEP_MISS_MAX];
+    int nmissing = 0;
+    int is_upgrade = 0;
+    int used_fmt = DEB_FMT_AUTO;
+    char oldver[256];
+    static const char * const mscripts[] =
+        { "preinst", "postinst", "prerm", "postrm", NULL };
+    int i;
+    if (!g_simulate && !g_no_check && !check_prereqs())
+        return -1;
+    if (tmpci_setup() != 0) {
+        fprintf(stderr, "udpkg: cannot create %s\n", db_tmpci());
+        return -1;
+    }
+    if (deb_open(debpath, g_format, db_tmpci(),
+                 ctrl_tar, sizeof(ctrl_tar), NULL,
+                 data_tar, sizeof(data_tar),
+                 1, 1, &used_fmt) != 0) {
+        fprintf(stderr,
+            "udpkg: cannot open '%s': not a valid .deb archive\n", debpath);
+        tmpci_cleanup();
+        return -1;
+    }
+    if (utar_extract(ctrl_tar, db_tmpci_ctrl(), 0) != 0) {
+        fprintf(stderr, "udpkg: failed to extract control archive\n");
+        tmpci_cleanup();
+        return -1;
+    }
+    snprintf(ctrl_file, sizeof(ctrl_file), "%s/control", db_tmpci_ctrl());
+    if (stat(ctrl_file, &st) != 0) {
+        char ctrl_file2[4096];
+        snprintf(ctrl_file2, sizeof(ctrl_file2),
+                 "%s/DEBIAN/control", db_tmpci_ctrl());
+        if (stat(ctrl_file2, &st) != 0) {
+            fprintf(stderr, "udpkg: control file not found in package\n");
+            tmpci_cleanup();
+            return -1;
+        }
+        strncpy(ctrl_file, ctrl_file2, sizeof(ctrl_file) - 1);
+        ctrl_file[sizeof(ctrl_file) - 1] = '\0';
+    }
+    if (ctrl_parse(ctrl_file, &ctrl) != 0) {
+        fprintf(stderr, "udpkg: cannot parse control file\n");
+        tmpci_cleanup();
+        return -1;
+    }
+    {
+        ctrl_diags_t diags;
+        int di;
+        ctrl_validate(&ctrl, &diags);
+        for (di = 0; di < diags.ndiags; di++) {
+            const ctrl_diag_t *dg = &diags.items[di];
+            const char *pkg_id = ctrl_get(&ctrl, "Package");
+            if (dg->severity == CTRL_VALID_FATAL) {
+                if (pkg_id && dg->line >= 0)
+                    fprintf(stderr,
+                        "udpkg: %s: control field error at line %d (%s): %s\n",
+                        pkg_id, dg->line, dg->field, dg->msg);
+                else if (pkg_id)
+                    fprintf(stderr,
+                        "udpkg: %s: control field error (%s): %s\n",
+                        pkg_id, dg->field, dg->msg);
+                else
+                    fprintf(stderr,
+                        "udpkg: control field error (%s): %s\n",
+                        dg->field, dg->msg);
+                tmpci_cleanup();
+                return -1;
+            }
+            if (dg->severity == CTRL_VALID_WARN) {
+                const char *pid = ctrl_get(&ctrl, "Package");
+                if (pid)
+                    fprintf(stderr, "udpkg: warning: %s: (%s): %s\n",
+                            pid, dg->field, dg->msg);
+                else
+                    fprintf(stderr, "udpkg: warning: (%s): %s\n",
+                            dg->field, dg->msg);
+            }
+        }
+    }
+    pkgname = ctrl_get(&ctrl, "Package");
+    if (!pkgname) {
+        fprintf(stderr, "udpkg: control file missing Package field\n");
+        tmpci_cleanup();
+        return -1;
+    }
+    log_write("format %s %s", pkgname,
+              used_fmt == DEB_FMT_OLD ? "old(0.939000)" : "new(2.0)");
+    conffiles_src[0] = '\0';
+    {
+        char cf1[4096], cf2[4096];
+        snprintf(cf1, sizeof(cf1), "%s/conffiles", db_tmpci_ctrl());
+        snprintf(cf2, sizeof(cf2), "%s/DEBIAN/conffiles", db_tmpci_ctrl());
+        if (stat(cf1, &st) == 0)
+            strncpy(conffiles_src, cf1, sizeof(conffiles_src) - 1);
+        else if (stat(cf2, &st) == 0)
+            strncpy(conffiles_src, cf2, sizeof(conffiles_src) - 1);
+        conffiles_src[sizeof(conffiles_src) - 1] = '\0';
+    }
+    if (conffiles_src[0])
+        load_conffiles(db_tmpci_ctrl(), confs, &nconfs);
+    arch = ctrl_get(&ctrl, "Architecture");
+    ver  = ctrl_get(&ctrl, "Version");
+    depends = ctrl_get(&ctrl, "Depends");
+    dep_parse(depends ? depends : "", &dl);
+    dep_check(&dl, batch, nbatch, missing, &nmissing, MISS_MAX);
+    if (nmissing > 0 && !force) {
+        int m;
+        fprintf(stderr,
+            "udpkg: %s: dependency problems prevent unpacking:\n",
+            pkgname);
+        for (m = 0; m < nmissing; m++)
+            fprintf(stderr,
+                "  udpkg: %s depends on %s; however:\n"
+                "   Package %s is not installed.\n",
+                pkgname, missing[m], missing[m]);
+        tmpci_cleanup();
+        return -1;
+    }
+    snprintf(raw_list,  sizeof(raw_list),  "%s/raw.list",  db_tmpci());
+    snprintf(norm_list, sizeof(norm_list), "%s/norm.list", db_tmpci());
+    utar_list(data_tar, 0, raw_list);
+    normalize_filelist(raw_list, norm_list);
+    oldver[0] = '\0';
+    is_upgrade = db_is_installed(pkgname);
+    if (is_upgrade)
+        db_get_version(pkgname, oldver, sizeof(oldver));
+    if (g_simulate) {
+        printf("Unpack %s (%s) (simulated)\n", pkgname, ver ? ver : "?");
+        tmpci_cleanup();
+        return 0;
+    }
+    if (is_upgrade)
+        printf("(Reading database ... )\nPreparing to unpack %s ...\n",
+               debpath);
+    else
+        printf("Selecting previously unselected package %s.\n"
+               "(Reading database ... )\nPreparing to unpack %s ...\n",
+               pkgname, debpath);
+    sn_processing(is_upgrade ? "upgrade" : "install", pkgname);
+    {
+        char script_path[4096];
+        snprintf(script_path, sizeof(script_path),
+                 "%s/preinst", db_tmpci_ctrl());
+        if (stat(script_path, &st) == 0 && (st.st_mode & S_IXUSR)) {
+            int sc;
+            sn_status(pkgname, ver ? ver : "", "half-installed");
+            if (is_upgrade)
+                sc = run_script(script_path, "upgrade",
+                                oldver[0] ? oldver : NULL);
+            else
+                sc = run_script(script_path, "install", NULL);
+            if (sc != 0) {
+                fprintf(stderr,
+                    "udpkg: subprocess preinst returned error code %d\n", sc);
+                tmpci_cleanup();
+                return -1;
+            }
+        }
+    }
+    printf("Unpacking %s (%s) ...\n", pkgname, ver ? ver : "?");
+    {
+        char instroot[4096];
+        strncpy(instroot, effective_instdir(), sizeof(instroot) - 1);
+        instroot[sizeof(instroot) - 1] = '\0';
+        if (nconfs > 0)
+            conffiles_presave(confs, nconfs, pkgname, is_upgrade);
+        if (utar_extract(data_tar, instroot, 0) != 0) {
+            fprintf(stderr, "udpkg: failed to extract data archive\n");
+            conffiles_cleanup_tmp(confs, nconfs);
+            tmpci_cleanup();
+            return -1;
+        }
+        if (nconfs > 0)
+            conffiles_apply(confs, nconfs);
+    }
+    sn_status(pkgname, ver ? ver : "", "unpacked");
+    if (db_install_unpacked(&ctrl, norm_list) != 0) {
+        fprintf(stderr, "udpkg: failed to update package database\n");
+        tmpci_cleanup();
+        return -1;
+    }
+    if (conffiles_src[0])
+        db_install_conffiles(pkgname, conffiles_src);
+    for (i = 0; mscripts[i]; i++) {
+        char src[4096];
+        snprintf(src, sizeof(src), "%s/%s", db_tmpci_ctrl(), mscripts[i]);
+        if (stat(src, &st) == 0)
+            db_install_script(pkgname, mscripts[i], src);
+    }
+    if (!g_no_triggers) {
+        char trig_src[4096];
+        snprintf(trig_src, sizeof(trig_src), "%s/triggers", db_tmpci_ctrl());
+        if (stat(trig_src, &st) == 0) {
+            int parse_rc;
+            trig_install_interests(pkgname, trig_src);
+            parse_rc = trig_activate_from_file(trig_src, pkgname, 0);
+            if (parse_rc == -2) {
+                fprintf(stderr,
+                    "udpkg: %s: DEBIAN/triggers contains unknown directive\n",
+                    pkgname);
+                tmpci_cleanup();
+                return -1;
+            }
+        }
+    }
+    log_write("unpack %s:%s %s %s",
+              pkgname, arch ? arch : "unknown",
+              is_upgrade && oldver[0] ? oldver : "<none>",
+              ver ? ver : "<none>");
+    tmpci_cleanup();
+    return 0;
+}
+
+static int op_unpack_batch(char **debpaths, int ndeb, int force) {
+    char *batch_names[BATCH_MAX];
+    int nbatch = 0;
+    ctrl_t ctrl;
+    const char *pkgname;
+    int i, ret = 0, nerr = 0;
+    log_write("startup archives unpack tar:%s fmt:%s",
+              utar_impl_name(), utar_fmt_name(utar_get_fmt()));
+    for (i = 0; i < ndeb && nbatch < BATCH_MAX; i++) {
+        if (read_ctrl_from_deb(debpaths[i], &ctrl) == 0) {
+            pkgname = ctrl_get(&ctrl, "Package");
+            if (pkgname) {
+                batch_names[nbatch] = strdup(pkgname);
+                if (batch_names[nbatch])
+                    nbatch++;
+            }
+        }
+    }
+    for (i = 0; i < ndeb; i++) {
+        if (op_unpack_one(debpaths[i],
+                          (const char * const *)batch_names, nbatch,
+                          force) != 0) {
+            ret = 1;
+            if (g_abort_after > 0) {
+                nerr++;
+                if (nerr >= g_abort_after) {
+                    fprintf(stderr,
+                        "udpkg: abort-after limit (%d) reached\n",
+                        g_abort_after);
+                    break;
+                }
+            }
+        }
+    }
+    for (i = 0; i < nbatch; i++)
+        free(batch_names[i]);
+    return ret;
+}
+
+static int op_yet_to_unpack(void) {
+    block_node_t *list = status_read_pub();
+    block_node_t *n;
+    ctrl_t c;
+    int found = 0;
+    for (n = list; n; n = n->next) {
+        const char *status_val;
+        if (ctrl_parse_str(n->text, &c) != 0)
+            continue;
+        status_val = ctrl_get(&c, "Status");
+        if (!status_val)
+            continue;
+        {
+            char sel[64], flag[64], state[64];
+            if (sscanf(status_val, "%63s %63s %63s", sel, flag, state) < 3)
+                continue;
+            if (strcmp(sel, "install") != 0)
+                continue;
+            if (strcmp(state, "installed") == 0)
+                continue;
+            printf("%s\n", n->name);
+            found = 1;
+        }
+    }
+    status_free_pub(list);
+    return found ? 0 : 1;
+}
+
+static int op_predep_package(void) {
+    block_node_t *list = status_read_pub();
+    block_node_t *n;
+    ctrl_t c;
+    int rc = 1;
+    for (n = list; n; n = n->next) {
+        const char *status_val, *predep_val;
+        if (ctrl_parse_str(n->text, &c) != 0)
+            continue;
+        status_val = ctrl_get(&c, "Status");
+        if (!status_val)
+            continue;
+        {
+            char sel[64], flag[64], state[64];
+            if (sscanf(status_val, "%63s %63s %63s", sel, flag, state) < 3)
+                continue;
+            if (strcmp(state, "unpacked") != 0 &&
+                strcmp(state, "half-configured") != 0)
+                continue;
+        }
+        predep_val = ctrl_get(&c, "Pre-Depends");
+        if (!predep_val)
+            continue;
+        {
+            dep_list_t dl;
+            char missing[DEP_GROUP_MAX][DEP_MISS_MAX];
+            int nmissing = 0;
+            dep_parse(predep_val, &dl);
+            dep_check(&dl, NULL, 0, missing, &nmissing, DEP_GROUP_MAX);
+            if (nmissing > 0)
+                continue;
+        }
+        {
+            int fi;
+            for (fi = 0; fi < c.nfields; fi++)
+                printf("%s: %s\n", c.fields[fi].key, c.fields[fi].val);
+            printf("\n");
+        }
+        rc = 0;
+        break;
+    }
+    status_free_pub(list);
+    return rc;
 }
 
 static int op_install_batch(char **debpaths, int ndeb, int force) {
@@ -1088,6 +1457,21 @@ static int op_remove(const char *name) {
     if (!db_is_installed(name)) {
         fprintf(stderr, "udpkg: %s: package not installed\n", name);
         return -1;
+    }
+    {
+        ctrl_t sc;
+        const char *sv;
+        char sel[64], flag[64], state[64];
+        if (db_get(name, &sc) == 0) {
+            sv = ctrl_get(&sc, "Status");
+            if (sv && sscanf(sv, "%63s %63s %63s", sel, flag, state) == 3) {
+                if (strcmp(state, "config-files") == 0) {
+                    fprintf(stderr,
+                        "udpkg: %s: already in config-files state\n", name);
+                    return 0;
+                }
+            }
+        }
     }
     if (!g_simulate && !g_no_check && !check_prereqs())
         return -1;
@@ -1157,18 +1541,28 @@ static int op_remove(const char *name) {
         free(files[i]);
     }
     free(files);
-    db_remove(name);
     {
-        char script_path[4096];
-        db_get_scriptpath(name, "postrm", script_path, sizeof(script_path));
-        if (stat(script_path, &st) == 0 && (st.st_mode & S_IXUSR)) {
-            int sc = run_script(script_path, "remove", NULL);
-            if (sc != 0)
-                fprintf(stderr,
-                    "udpkg: subprocess postrm returned error code %d\n", sc);
+        int has_cf = db_has_conffiles(name);
+        if (has_cf) {
+            db_set_state(name, "deinstall", "ok", "config-files");
+        } else {
+            db_remove(name);
         }
+        {
+            char script_path[4096];
+            db_get_scriptpath(name, "postrm", script_path, sizeof(script_path));
+            if (stat(script_path, &st) == 0 && (st.st_mode & S_IXUSR)) {
+                int sc = run_script(script_path, "remove", NULL);
+                if (sc != 0)
+                    fprintf(stderr,
+                        "udpkg: subprocess postrm returned error code %d\n", sc);
+            }
+        }
+        if (has_cf)
+            sn_status(name, ver[0] ? ver : "", "config-files");
+        else
+            sn_status(name, ver[0] ? ver : "", "not-installed");
     }
-    sn_status(name, ver[0] ? ver : "", "not-installed");
     if (!g_no_triggers)
         trig_remove_interests(name);
     db_remove_scripts(name);
@@ -1213,6 +1607,7 @@ static int op_purge(const char *name) {
         fclose(fp);
     }
     db_remove_conffiles(name);
+    db_remove(name);
     sn_status(name, "", "not-installed");
     return rc;
 }
@@ -1304,9 +1699,14 @@ static int op_show(const char *debpath) {
     }
     name = ctrl_get(&ctrl, "Package");
     ver  = ctrl_get(&ctrl, "Version");
-    printf("%s %s\n",
-           name ? name : "(unknown)",
-           ver  ? ver  : "(unknown)");
+    if (g_robot)
+        printf("%s\t%s\n",
+               name ? name : "",
+               ver  ? ver  : "");
+    else
+        printf("%s %s\n",
+               name ? name : "(unknown)",
+               ver  ? ver  : "(unknown)");
     return 0;
 }
 
@@ -1713,6 +2113,334 @@ static int op_build(const char *srcdir, const char *outarg) {
     return rc;
 }
 
+
+static int op_compare_versions(const char *a, const char *op, const char *b) {
+    int empty_a, empty_b, c, result;
+    int noawait_empty = 0;
+    empty_a = (!a || a[0] == '\0');
+    empty_b = (!b || b[0] == '\0');
+    if (strncmp(op, "lt", 2) == 0 || strncmp(op, "le", 2) == 0 ||
+        strncmp(op, "eq", 2) == 0 || strncmp(op, "ne", 2) == 0 ||
+        strncmp(op, "ge", 2) == 0 || strncmp(op, "gt", 2) == 0) {
+        noawait_empty = (strlen(op) > 2 && strcmp(op + 2, "-nl") == 0);
+    }
+    if (empty_a || empty_b) {
+        if (empty_a && empty_b)
+            c = 0;
+        else if (empty_a)
+            c = noawait_empty ?  1 : -1;
+        else
+            c = noawait_empty ? -1 :  1;
+    } else {
+        c = ver_cmp_public(a, b);
+    }
+    if (strcmp(op, "lt")    == 0 || strcmp(op, "lt-nl") == 0 ||
+        strcmp(op, "<<")    == 0 || strcmp(op, "<")     == 0)
+        result = (c < 0);
+    else if (strcmp(op, "le")    == 0 || strcmp(op, "le-nl") == 0 ||
+             strcmp(op, "<=")    == 0)
+        result = (c <= 0);
+    else if (strcmp(op, "eq")    == 0 || strcmp(op, "=") == 0)
+        result = (c == 0);
+    else if (strcmp(op, "ne")    == 0)
+        result = (c != 0);
+    else if (strcmp(op, "ge")    == 0 || strcmp(op, "ge-nl") == 0 ||
+             strcmp(op, ">=")    == 0)
+        result = (c >= 0);
+    else if (strcmp(op, "gt")    == 0 || strcmp(op, "gt-nl") == 0 ||
+             strcmp(op, ">>")    == 0 || strcmp(op, ">")     == 0)
+        result = (c > 0);
+    else {
+        fprintf(stderr, "udpkg: --compare-versions: unknown operator '%s'\n", op);
+        return 2;
+    }
+    return result ? 0 : 1;
+}
+
+
+static int op_update_avail(const char *pkgfile) {
+    char dst[4096];
+    FILE *fs, *fd;
+    char buf[4096];
+    size_t nr;
+    apath_pub(dst, sizeof(dst), "/available");
+    if (!pkgfile || strcmp(pkgfile, "-") == 0) {
+        fd = fopen(dst, "w");
+        if (!fd) {
+            fprintf(stderr, "udpkg: cannot open '%s' for writing\n", dst);
+            return -1;
+        }
+        while ((nr = fread(buf, 1, sizeof(buf), stdin)) > 0)
+            fwrite(buf, 1, nr, fd);
+        fclose(fd);
+        return 0;
+    }
+    fs = fopen(pkgfile, "r");
+    if (!fs) {
+        fprintf(stderr, "udpkg: cannot open '%s': %s\n", pkgfile, strerror(errno));
+        return -1;
+    }
+    fd = fopen(dst, "w");
+    if (!fd) {
+        fclose(fs);
+        fprintf(stderr, "udpkg: cannot open '%s' for writing\n", dst);
+        return -1;
+    }
+    while ((nr = fread(buf, 1, sizeof(buf), fs)) > 0)
+        fwrite(buf, 1, nr, fd);
+    fclose(fs);
+    fclose(fd);
+    return 0;
+}
+
+static int op_merge_avail(const char *pkgfile) {
+    char dst[4096];
+    FILE *fs, *fd;
+    char buf[4096];
+    size_t nr;
+    apath_pub(dst, sizeof(dst), "/available");
+    if (!pkgfile || strcmp(pkgfile, "-") == 0)
+        fs = stdin;
+    else {
+        fs = fopen(pkgfile, "r");
+        if (!fs) {
+            fprintf(stderr, "udpkg: cannot open '%s': %s\n",
+                    pkgfile, strerror(errno));
+            return -1;
+        }
+    }
+    fd = fopen(dst, "a");
+    if (!fd) {
+        if (fs != stdin) fclose(fs);
+        fprintf(stderr, "udpkg: cannot open '%s' for appending\n", dst);
+        return -1;
+    }
+    while ((nr = fread(buf, 1, sizeof(buf), fs)) > 0)
+        fwrite(buf, 1, nr, fd);
+    if (fs != stdin) fclose(fs);
+    fclose(fd);
+    return 0;
+}
+
+static int op_clear_avail(void) {
+    char dst[4096];
+    FILE *fd;
+    apath_pub(dst, sizeof(dst), "/available");
+    fd = fopen(dst, "w");
+    if (!fd) {
+        fprintf(stderr, "udpkg: cannot clear '%s': %s\n", dst, strerror(errno));
+        return -1;
+    }
+    fclose(fd);
+    return 0;
+}
+
+static int op_forget_old_unavail(void) {
+    return 0;
+}
+
+
+static int op_search(const char *pattern) {
+    char info_dir[4096];
+    DIR *d;
+    struct dirent *de;
+    int found = 0;
+    apath_pub(info_dir, sizeof(info_dir), "/info");
+    d = opendir(info_dir);
+    if (!d) {
+        fprintf(stderr, "udpkg: cannot open info directory\n");
+        return 1;
+    }
+    while ((de = readdir(d)) != NULL) {
+        char *dot;
+        char pkgname[256];
+        char listpath[8192];
+        FILE *fp;
+        char line[4096];
+        size_t nlen;
+        if (de->d_name[0] == '.')
+            continue;
+        dot = strrchr(de->d_name, '.');
+        if (!dot || strcmp(dot, ".list") != 0)
+            continue;
+        nlen = (size_t)(dot - de->d_name);
+        if (nlen == 0 || nlen >= sizeof(pkgname))
+            continue;
+        memcpy(pkgname, de->d_name, nlen);
+        pkgname[nlen] = '\0';
+        snprintf(listpath, sizeof(listpath), "%s/%s", info_dir, de->d_name);
+        fp = fopen(listpath, "r");
+        if (!fp)
+            continue;
+        while (fgets(line, sizeof(line), fp)) {
+            size_t len = strlen(line);
+            while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+                line[--len] = '\0';
+            if (len == 0)
+                continue;
+            if (strstr(line, pattern) != NULL ||
+                fnmatch(pattern, line, 0) == 0) {
+                printf("%s: %s\n", pkgname, line);
+                found = 1;
+            }
+        }
+        fclose(fp);
+    }
+    closedir(d);
+    return found ? 0 : 1;
+}
+
+static int op_verify_deb(const char *debpath) {
+    char tmpdir[64];
+    char ctrl_tar[4096];
+    char data_tar[4096];
+    char ctrl_subdir[4096];
+    int used_fmt;
+    int rc;
+    strncpy(tmpdir, "/tmp/udpkg_vfy_XXXXXX", sizeof(tmpdir) - 1);
+    tmpdir[sizeof(tmpdir) - 1] = '\0';
+    if (!mkdtemp(tmpdir)) {
+        fprintf(stderr, "udpkg: cannot create temp dir\n");
+        return -1;
+    }
+    snprintf(ctrl_subdir, sizeof(ctrl_subdir), "%s/ctrl", tmpdir);
+    if (mkdir(ctrl_subdir, 0755) != 0) {
+        cleanup_dir(tmpdir);
+        return -1;
+    }
+    rc = deb_open(debpath, g_format, tmpdir,
+                  ctrl_tar, sizeof(ctrl_tar), NULL,
+                  data_tar, sizeof(data_tar),
+                  1, 0, &used_fmt);
+    if (rc != 0) {
+        fprintf(stderr,
+            "udpkg: %s: failed integrity check (cannot parse archive)\n",
+            debpath);
+        cleanup_dir(tmpdir);
+        return 1;
+    }
+    if (utar_extract(ctrl_tar, ctrl_subdir, 0) != 0) {
+        fprintf(stderr,
+            "udpkg: %s: failed integrity check (cannot extract control)\n",
+            debpath);
+        cleanup_dir(tmpdir);
+        return 1;
+    }
+    {
+        ctrl_t ctrl;
+        char ctrl_file[8192];
+        char ctrl_file2[8192];
+        struct stat st;
+        snprintf(ctrl_file,  sizeof(ctrl_file),  "%s/control",        ctrl_subdir);
+        snprintf(ctrl_file2, sizeof(ctrl_file2), "%s/DEBIAN/control", ctrl_subdir);
+        if (stat(ctrl_file, &st) != 0 && stat(ctrl_file2, &st) != 0) {
+            fprintf(stderr,
+                "udpkg: %s: failed integrity check (no control file)\n",
+                debpath);
+            cleanup_dir(tmpdir);
+            return 1;
+        }
+        if (stat(ctrl_file, &st) != 0)
+            strncpy(ctrl_file, ctrl_file2, sizeof(ctrl_file) - 1);
+        ctrl_file[sizeof(ctrl_file) - 1] = '\0';
+        if (ctrl_parse(ctrl_file, &ctrl) != 0) {
+            fprintf(stderr,
+                "udpkg: %s: failed integrity check (cannot parse control)\n",
+                debpath);
+            cleanup_dir(tmpdir);
+            return 1;
+        }
+        {
+            ctrl_diags_t diags;
+            int di;
+            ctrl_validate(&ctrl, &diags);
+            for (di = 0; di < diags.ndiags; di++) {
+                if (diags.items[di].severity == CTRL_VALID_FATAL) {
+                    fprintf(stderr,
+                        "udpkg: %s: failed integrity check (%s): %s\n",
+                        debpath, diags.items[di].field, diags.items[di].msg);
+                    cleanup_dir(tmpdir);
+                    return 1;
+                }
+            }
+        }
+    }
+    printf("udpkg: %s: ok\n", debpath);
+    cleanup_dir(tmpdir);
+    return 0;
+}
+
+static int op_set_selections(void) {
+    char line[4096];
+    int nerr = 0;
+    while (fgets(line, sizeof(line), stdin)) {
+        char pkg[256], sel[64];
+        char *p = line;
+        size_t len;
+        while (*p == ' ' || *p == '\t') p++;
+        len = strlen(p);
+        while (len > 0 && (p[len-1] == '\n' || p[len-1] == '\r' ||
+                            p[len-1] == ' '  || p[len-1] == '\t'))
+            p[--len] = '\0';
+        if (len == 0 || p[0] == '#')
+            continue;
+        if (sscanf(p, "%255s %63s", pkg, sel) != 2) {
+            fprintf(stderr, "udpkg: --set-selections: bad line: %s\n", line);
+            nerr++;
+            continue;
+        }
+        if (strcmp(sel, "install")    != 0 &&
+            strcmp(sel, "hold")       != 0 &&
+            strcmp(sel, "deinstall")  != 0 &&
+            strcmp(sel, "purge")      != 0) {
+            fprintf(stderr,
+                "udpkg: --set-selections: unknown selection state '%s'\n",
+                sel);
+            nerr++;
+            continue;
+        }
+        if (db_is_installed(pkg)) {
+            ctrl_t c;
+            if (db_get(pkg, &c) == 0) {
+                char flag[64], state[64];
+                const char *sv = ctrl_get(&c, "Status");
+                flag[0] = '\0'; state[0] = '\0';
+                if (sv)
+                    sscanf(sv, "%*s %63s %63s", flag, state);
+                if (flag[0] == '\0')
+                    strncpy(flag, "ok", sizeof(flag) - 1);
+                if (state[0] == '\0')
+                    strncpy(state, "installed", sizeof(state) - 1);
+                db_set_state(pkg, sel, flag, state);
+            }
+        }
+    }
+    return nerr ? 1 : 0;
+}
+
+static int op_clear_selections(void) {
+    block_node_t *list = status_read_pub();
+    block_node_t *n;
+    for (n = list; n; n = n->next) {
+        ctrl_t c;
+        const char *sv;
+        char flag[64], state[64];
+        if (ctrl_parse_str(n->text, &c) != 0)
+            continue;
+        sv = ctrl_get(&c, "Status");
+        flag[0] = '\0'; state[0] = '\0';
+        if (sv)
+            sscanf(sv, "%*s %63s %63s", flag, state);
+        if (flag[0] == '\0')
+            strncpy(flag, "ok", sizeof(flag) - 1);
+        if (state[0] == '\0')
+            strncpy(state, "installed", sizeof(state) - 1);
+        db_set_state(n->name, "deinstall", flag, state);
+    }
+    status_free_pub(list);
+    return 0;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [options] <action> ...\n"
@@ -1727,6 +2455,13 @@ static void usage(const char *prog) {
         "  -L, --list-files <pkg>                List files owned by package\n"
         "  -s, --status  <pkg>                   Show package status\n"
         "  -W, --show    <pkg.deb>               Show package name and version\n"
+        "      --unpack     <pkg.deb> [...]      Unpack package, do not configure\n"
+        "      --yet-to-unpack                   List packages selected but not unpacked\n"
+        "      --predep-package                  Print a Pre-Depends target ready to configure\n"
+        "      --search   <pattern>             Search for filename in installed packages\n"
+        "      --verify   <pkg.deb> [...]        Verify archive integrity\n"
+        "      --set-selections                  Set pkg selections from stdin (pkg sel)\n"
+        "      --clear-selections                Mark all non-essential pkgs as deinstall\n"
         "      --info    <pkg.deb>               Show detailed package file info\n"
         "      --contents <pkg.deb>              List contents of a package\n"
         "      --extract  <pkg.deb> <dir>        Extract package files to dir\n"
@@ -1792,26 +2527,48 @@ static void usage(const char *prog) {
         "      --await                               Put activating pkg in await (default)\n"
         "      --check-supported                     Exit 0 if triggers are supported\n"
         "      --no-act                              Test only, do not change anything\n"
+        "\n"  "  --compare-versions <a> <op> <b>  Compare version strings\n"
+        "    lt le eq ne ge gt          (empty treated as earlier than any)\n"
+        "    lt-nl le-nl ge-nl gt-nl    (empty treated as later than any)\n"
+        "    < << <= = >= >> >          (control file syntax compat)\n"
+        "  --robot                      Machine-readable output for some commands\n"
+        "  --update-avail [<Pkgs-file>] Replace available packages info\n"
+        "  --merge-avail [<Pkgs-file>]  Merge with available packages info\n"
+        "  --clear-avail               Erase existing available info\n"
+        "  --forget-old-unavail        Forget uninstalled unavailable pkgs\n"
     );
 }
 
 static const char *normalize_action(const char *arg) {
-    if (strcmp(arg, "--install")    == 0) return "-i";
-    if (strcmp(arg, "--remove")     == 0) return "-r";
-    if (strcmp(arg, "--purge")      == 0) return "-P";
-    if (strcmp(arg, "--build")      == 0) return "-b";
-    if (strcmp(arg, "--control")    == 0) return "-e";
-    if (strcmp(arg, "--list")       == 0) return "-l";
-    if (strcmp(arg, "--list-files") == 0) return "-L";
-    if (strcmp(arg, "--status")     == 0) return "-s";
-    if (strcmp(arg, "--show")       == 0) return "-W";
+    if (strcmp(arg, "--install")      == 0) return "-i";
+    if (strcmp(arg, "--remove")       == 0) return "-r";
+    if (strcmp(arg, "--purge")        == 0) return "-P";
+    if (strcmp(arg, "--build")        == 0) return "-b";
+    if (strcmp(arg, "--control")      == 0) return "-e";
+    if (strcmp(arg, "--list")         == 0) return "-l";
+    if (strcmp(arg, "--list-files")   == 0) return "-L";
+    if (strcmp(arg, "--status")       == 0) return "-s";
+    if (strcmp(arg, "--show")         == 0) return "-W";
+    if (strcmp(arg, "--unpack")       == 0) return "--unpack";
+    if (strcmp(arg, "--yet-to-unpack") == 0) return "--yet-to-unpack";
+    if (strcmp(arg, "--predep-package")     == 0) return "--predep-package";
+    if (strcmp(arg, "--compare-versions")   == 0) return "--compare-versions";
+    if (strcmp(arg, "--update-avail")       == 0) return "--update-avail";
+    if (strcmp(arg, "--merge-avail")        == 0) return "--merge-avail";
+    if (strcmp(arg, "--clear-avail")        == 0) return "--clear-avail";
+    if (strcmp(arg, "--forget-old-unavail") == 0) return "--forget-old-unavail";
+    if (strcmp(arg, "--search")            == 0) return "--search";
+    if (strcmp(arg, "--verify")             == 0) return "--verify";
+    if (strcmp(arg, "--set-selections")     == 0) return "--set-selections";
+    if (strcmp(arg, "--clear-selections")   == 0) return "--clear-selections";
     return arg;
 }
 
 static int needs_root_priv(const char *action) {
-    return strcmp(action, "-i") == 0
-        || strcmp(action, "-r") == 0
-        || strcmp(action, "-P") == 0;
+    return strcmp(action, "-i")       == 0
+        || strcmp(action, "-r")       == 0
+        || strcmp(action, "-P")       == 0
+        || strcmp(action, "--unpack") == 0;
 }
 
 static void parse_ignore_depends(const char *val) {
@@ -1851,7 +2608,19 @@ static const char *action_long_name(const char *a) {
     if (strcmp(a, "--help")     == 0) return "--help";
     if (strcmp(a, "-h")         == 0) return "--help";
     if (strcmp(a, "-?")         == 0) return "--help";
-    if (strcmp(a, "--trigger")  == 0) return "--trigger";
+    if (strcmp(a, "--trigger")        == 0) return "--trigger";
+    if (strcmp(a, "--unpack")         == 0) return "--unpack";
+    if (strcmp(a, "--yet-to-unpack")  == 0) return "--yet-to-unpack";
+    if (strcmp(a, "--predep-package")     == 0) return "--predep-package";
+    if (strcmp(a, "--compare-versions")   == 0) return "--compare-versions";
+    if (strcmp(a, "--update-avail")       == 0) return "--update-avail";
+    if (strcmp(a, "--merge-avail")        == 0) return "--merge-avail";
+    if (strcmp(a, "--clear-avail")        == 0) return "--clear-avail";
+    if (strcmp(a, "--forget-old-unavail") == 0) return "--forget-old-unavail";
+    if (strcmp(a, "--search")             == 0) return "--search";
+    if (strcmp(a, "--verify")              == 0) return "--verify";
+    if (strcmp(a, "--set-selections")      == 0) return "--set-selections";
+    if (strcmp(a, "--clear-selections")    == 0) return "--clear-selections";
     return NULL;
 }
 
@@ -2006,6 +2775,8 @@ int main(int argc, char *argv[]) {
             g_no_pager = 1;
         } else if (strcmp(argv[i], "--no-triggers") == 0) {
             g_no_triggers = 1;
+        } else if (strcmp(argv[i], "--robot") == 0) {
+            g_robot = 1;
         } else if (strcmp(argv[i], "--no-check") == 0
                    || strcmp(argv[i], "--nocheck") == 0) {
             g_no_check = 1;
@@ -2387,6 +3158,132 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         ret = op_install_batch(fwd + start, nfwd - start, force);
+        if (!g_simulate)
+            lock_release();
+        sn_close(); log_close();
+        return ret;
+    }
+    if (strcmp(fwd[1], "--unpack") == 0) {
+        int force = g_force_deps;
+        int start = 2;
+        if (nfwd < 3) {
+            fprintf(stderr, "udpkg: --unpack requires at least one package file\n");
+            sn_close(); log_close();
+            return 1;
+        }
+        if (nfwd > 2 && strcmp(fwd[2], "-f") == 0) {
+            force = 1;
+            start = 3;
+        }
+        if (start >= nfwd) {
+            fprintf(stderr, "udpkg: --unpack requires at least one package file\n");
+            sn_close(); log_close();
+            return 1;
+        }
+        if (!g_simulate && lock_acquire() != 0) {
+            sn_close(); log_close();
+            return 1;
+        }
+        ret = op_unpack_batch(fwd + start, nfwd - start, force);
+        if (!g_simulate)
+            lock_release();
+        sn_close(); log_close();
+        return ret;
+    }
+    if (strcmp(fwd[1], "--yet-to-unpack") == 0) {
+        ret = op_yet_to_unpack();
+        sn_close(); log_close();
+        return ret;
+    }
+    if (strcmp(fwd[1], "--predep-package") == 0) {
+        ret = op_predep_package();
+        sn_close(); log_close();
+        return ret;
+    }
+    if (strcmp(fwd[1], "--compare-versions") == 0) {
+        const char *va, *op, *vb;
+        if (nfwd < 5) {
+            fprintf(stderr,
+                "udpkg: --compare-versions requires <ver-a> <op> <ver-b>\n");
+            sn_close(); log_close();
+            return 2;
+        }
+        va = fwd[2]; op = fwd[3]; vb = fwd[4];
+        {
+            int rc = op_compare_versions(va, op, vb);
+            sn_close(); log_close();
+            return rc;
+        }
+    }
+    if (strcmp(fwd[1], "--update-avail") == 0) {
+        ret = op_update_avail(nfwd > 2 ? fwd[2] : NULL);
+        sn_close(); log_close();
+        return ret == 0 ? 0 : 1;
+    }
+    if (strcmp(fwd[1], "--merge-avail") == 0) {
+        ret = op_merge_avail(nfwd > 2 ? fwd[2] : NULL);
+        sn_close(); log_close();
+        return ret == 0 ? 0 : 1;
+    }
+    if (strcmp(fwd[1], "--clear-avail") == 0) {
+        ret = op_clear_avail();
+        sn_close(); log_close();
+        return ret == 0 ? 0 : 1;
+    }
+    if (strcmp(fwd[1], "--forget-old-unavail") == 0) {
+        ret = op_forget_old_unavail();
+        sn_close(); log_close();
+        return ret;
+    }
+    if (strcmp(fwd[1], "--search") == 0) {
+        if (nfwd < 3) {
+            fprintf(stderr, "udpkg: --search requires a pattern\n");
+            sn_close(); log_close();
+            return 1;
+        }
+        {
+            int i, rc = 1;
+            for (i = 2; i < nfwd; i++) {
+                int r = op_search(fwd[i]);
+                if (r == 0) rc = 0;
+            }
+            sn_close(); log_close();
+            return rc;
+        }
+    }
+    if (strcmp(fwd[1], "--verify") == 0) {
+        if (nfwd < 3) {
+            fprintf(stderr, "udpkg: --verify requires at least one package file\n");
+            sn_close(); log_close();
+            return 1;
+        }
+        {
+            int i, rc = 0;
+            for (i = 2; i < nfwd; i++) {
+                if (op_verify_deb(fwd[i]) != 0)
+                    rc = 1;
+            }
+            sn_close(); log_close();
+            return rc;
+        }
+    }
+    if (strcmp(fwd[1], "--set-selections") == 0) {
+        if (!g_simulate && lock_acquire() != 0) {
+            sn_close(); log_close();
+            return 1;
+        }
+        ret = op_set_selections();
+        if (!g_simulate)
+            lock_release();
+        sn_close(); log_close();
+        return ret;
+    }
+    if (strcmp(fwd[1], "--clear-selections") == 0) {
+        if (!g_simulate && lock_acquire() != 0) {
+            sn_close(); log_close();
+            return 1;
+        }
+        ret = op_clear_selections();
         if (!g_simulate)
             lock_release();
         sn_close(); log_close();

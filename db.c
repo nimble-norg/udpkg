@@ -13,7 +13,6 @@
 #include "db.h"
 #include "ctrl.h"
 
-#define BLOCK_MAX 16384
 
 static char g_root[4096]    = "";
 static char g_admindir[4096] = "";
@@ -93,11 +92,7 @@ static int mkdirp(const char *path, mode_t mode) {
     return 0;
 }
 
-typedef struct block_node {
-    char               name[256];
-    char               text[BLOCK_MAX];
-    struct block_node *next;
-} block_node_t;
+
 
 static void extract_name(block_node_t *node) {
     const char *p = node->text;
@@ -129,7 +124,7 @@ static block_node_t *status_read(void) {
     char path[4096];
     FILE *fp;
     char line[4096];
-    char buf[BLOCK_MAX];
+    char buf[DB_BLOCK_MAX];
     size_t blen = 0;
     block_node_t *head = NULL;
     block_node_t **tail = &head;
@@ -258,7 +253,7 @@ int db_init(void) {
 }
 
 int db_install(const ctrl_t *c, const char *listfile) {
-    char entry[BLOCK_MAX];
+    char entry[DB_BLOCK_MAX];
     char info_dir[4096];
     size_t elen = 0;
     int i;
@@ -372,7 +367,21 @@ int db_is_installed(const char *name) {
     int found = 0;
     for (n = list; n; n = n->next) {
         if (strcmp(n->name, name) == 0) {
-            found = 1;
+            ctrl_t c;
+            const char *sv;
+            char sel[64], flag[64], state[64];
+            if (ctrl_parse_str(n->text, &c) == 0) {
+                sv = ctrl_get(&c, "Status");
+                if (sv && sscanf(sv, "%63s %63s %63s",
+                                  sel, flag, state) == 3) {
+                    if (strcmp(state, "not-installed") != 0)
+                        found = 1;
+                } else {
+                    found = 1;
+                }
+            } else {
+                found = 1;
+            }
             break;
         }
     }
@@ -697,4 +706,160 @@ int db_is_conffile(const char *name, const char *filepath) {
     }
     fclose(fp);
     return 0;
+}
+
+block_node_t *status_read_pub(void) {
+    return status_read();
+}
+
+void status_free_pub(block_node_t *head) {
+    status_free(head);
+}
+
+int db_install_unpacked(const ctrl_t *c, const char *listfile) {
+    char entry[DB_BLOCK_MAX];
+    char info_dir[4096];
+    size_t elen = 0;
+    int i;
+    const char *name;
+    block_node_t *list;
+    block_node_t *node;
+    block_node_t *prev, *cur, *nxt;
+    char dst[8192];
+    char buf[8192];
+    size_t nr;
+    FILE *src_fp, *dst_fp;
+    apath(info_dir, sizeof(info_dir), "/info");
+    name = ctrl_get(c, "Package");
+    if (!name)
+        return -1;
+    elen += (size_t)snprintf(entry + elen, sizeof(entry) - elen,
+        "Package: %s\n", name);
+    elen += (size_t)snprintf(entry + elen, sizeof(entry) - elen,
+        "Status: install ok unpacked\n");
+    for (i = 0; i < c->nfields; i++) {
+        if (strcasecmp(c->fields[i].key, "Package") == 0)
+            continue;
+        elen += (size_t)snprintf(entry + elen, sizeof(entry) - elen,
+            "%s: %s\n", c->fields[i].key, c->fields[i].val);
+        if (elen >= sizeof(entry) - 2)
+            break;
+    }
+    while (elen > 0 && entry[elen-1] == '\n')
+        elen--;
+    entry[elen] = '\0';
+    list = status_read();
+    prev = NULL; cur = list;
+    while (cur) {
+        nxt = cur->next;
+        if (strcmp(cur->name, name) == 0) {
+            if (prev) prev->next = nxt;
+            else      list = nxt;
+            free(cur);
+        } else {
+            prev = cur;
+        }
+        cur = nxt;
+    }
+    node = calloc(1, sizeof(*node));
+    if (!node) {
+        status_free(list);
+        return -1;
+    }
+    strncpy(node->name, name, sizeof(node->name) - 1);
+    strncpy(node->text, entry, sizeof(node->text) - 1);
+    node->next = list;
+    if (status_write(node) != 0) {
+        node->next = NULL;
+        free(node);
+        status_free(list);
+        return -1;
+    }
+    node->next = NULL;
+    free(node);
+    status_free(list);
+    if (listfile) {
+        snprintf(dst, sizeof(dst), "%s/%s.list", info_dir, name);
+        src_fp = fopen(listfile, "r");
+        if (!src_fp)
+            return 0;
+        dst_fp = fopen(dst, "w");
+        if (!dst_fp) {
+            fclose(src_fp);
+            return -1;
+        }
+        while ((nr = fread(buf, 1, sizeof(buf), src_fp)) > 0)
+            fwrite(buf, 1, nr, dst_fp);
+        fclose(src_fp);
+        fclose(dst_fp);
+    }
+    return 0;
+}
+
+int db_set_state(const char *name,
+                 const char *sel, const char *flag, const char *state) {
+    block_node_t *list = status_read();
+    block_node_t *n;
+    char new_status[128];
+    int found = 0;
+    snprintf(new_status, sizeof(new_status), "Status: %s %s %s",
+             sel, flag, state);
+    for (n = list; n; n = n->next) {
+        if (strcmp(n->name, name) == 0) {
+            char *p = strstr(n->text, "Status:");
+            if (p) {
+                char *nl = strchr(p, '\n');
+                size_t blen = (size_t)(p - n->text);
+                size_t nslen = strlen(new_status);
+                size_t alen = nl ? strlen(nl + 1) : 0;
+                size_t need = blen + nslen + (alen ? alen + 1 : 0) + 1;
+                if (need < sizeof(n->text)) {
+                    memmove(p + nslen + (alen ? 1 : 0),
+                            nl ? nl + 1 : "", alen + 1);
+                    memcpy(p, new_status, nslen);
+                    if (alen)
+                        p[nslen] = '\n';
+                    n->text[blen + nslen + (alen ? alen + 1 : 0)] = '\0';
+                }
+            } else {
+                size_t nslen = strlen(new_status);
+                size_t tlen  = strlen(n->text);
+                if (nslen + 1 + tlen + 1 < sizeof(n->text)) {
+                    memmove(n->text + nslen + 1, n->text, tlen + 1);
+                    memcpy(n->text, new_status, nslen);
+                    n->text[nslen] = '\n';
+                }
+            }
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        block_node_t *node = calloc(1, sizeof(*node));
+        if (node) {
+            strncpy(node->name, name, sizeof(node->name) - 1);
+            node->name[sizeof(node->name) - 1] = '\0';
+            snprintf(node->text, sizeof(node->text),
+                     "Package: %s\n%s", name, new_status);
+            node->next = list;
+            list = node;
+        }
+    }
+    {
+        int rc = status_write_ex(list, 0);
+        status_free(list);
+        return rc;
+    }
+}
+
+int db_has_conffiles(const char *name) {
+    char path[4096];
+    struct stat st;
+    apath(path, sizeof(path), "/info");
+    snprintf(path, sizeof(path), "%s/info/%s.conffiles", admindir(), name);
+    return (stat(path, &st) == 0 && st.st_size > 0);
+}
+
+void apath_pub(char *buf, size_t sz, const char *suffix) {
+    apath(buf, sz, suffix);
 }
