@@ -18,6 +18,7 @@
 #include "log.h"
 #include "utar.h"
 #include "status_notify.h"
+#include "trigger.h"
 
 extern int chroot(const char *);
 
@@ -53,6 +54,7 @@ static int  g_abort_after         = 0;
 static int  g_simulate            = 0;
 static int  g_format              = DEB_FMT_AUTO;
 static int  g_no_pager            = 0;
+static int  g_no_triggers         = 0;
 
 static const char *g_ignore_dep[IGNORE_DEP_MAX];
 static int         g_nignore_dep = 0;
@@ -642,6 +644,17 @@ static int op_info(const char *debpath) {
     return 0;
 }
 
+
+static int run_triggered_postinst(const char *pkg, const char *trigname) {
+    char script_path[4096];
+    struct stat st;
+    db_get_scriptpath(pkg, "postinst", script_path, sizeof(script_path));
+    if (stat(script_path, &st) != 0 || !(st.st_mode & S_IXUSR))
+        return 0;
+    printf("Processing triggers for %s ...\n", pkg);
+    return run_script(script_path, "triggered", trigname);
+}
+
 static int op_install_one(const char *debpath,
                            const char * const *batch, int nbatch,
                            int force) {
@@ -981,6 +994,22 @@ static int op_install_one(const char *debpath,
         if (stat(src, &st) == 0)
             db_install_script(pkgname, mscripts[i], src);
     }
+    if (!g_no_triggers) {
+        char trig_src[4096];
+        snprintf(trig_src, sizeof(trig_src), "%s/triggers", db_tmpci_ctrl());
+        if (stat(trig_src, &st) == 0) {
+            int parse_rc;
+            trig_install_interests(pkgname, trig_src);
+            parse_rc = trig_activate_from_file(trig_src, pkgname, 0);
+            if (parse_rc == -2) {
+                fprintf(stderr,
+                    "udpkg: %s: DEBIAN/triggers contains unknown directive\n",
+                    pkgname);
+                tmpci_cleanup();
+                return -1;
+            }
+        }
+    }
     {
         char script_path[4096];
         db_get_scriptpath(pkgname, "postinst", script_path, sizeof(script_path));
@@ -995,6 +1024,8 @@ static int op_install_one(const char *debpath,
         }
     }
     sn_status(pkgname, ver ? ver : "", "installed");
+    if (!g_no_triggers)
+        trig_pending_run(run_triggered_postinst);
     log_write("%s %s:%s %s %s",
               is_upgrade ? "update" : "install",
               pkgname, arch ? arch : "unknown",
@@ -1138,6 +1169,8 @@ static int op_remove(const char *name) {
         }
     }
     sn_status(name, ver[0] ? ver : "", "not-installed");
+    if (!g_no_triggers)
+        trig_remove_interests(name);
     db_remove_scripts(name);
     return 0;
 }
@@ -1686,65 +1719,80 @@ static void usage(const char *prog) {
         "\n"
         "Actions:\n"
         "  -i, --install [-f] <pkg.deb> [...]   Install package(s)\n"
-        "  -r, --remove <pkg> [...]              Remove package(s)\n"
-        "  -P, --purge <pkg> [...]               Purge package(s) and conffiles\n"
-        "  -b, --build <dir> [<output.deb>]      Build a .deb from a directory\n"
+        "  -r, --remove  <pkg> [...]             Remove package(s)\n"
+        "  -P, --purge   <pkg> [...]             Purge package(s) and conffiles\n"
+        "  -b, --build   <dir> [<out.deb>]       Build a .deb from a directory\n"
         "  -e, --control <pkg.deb> <dir>         Extract control files to dir\n"
-        "  -l, --list [pattern]                  List installed packages\n"
+        "  -l, --list    [pattern]               List installed packages\n"
         "  -L, --list-files <pkg>                List files owned by package\n"
-        "  -s, --status <pkg>                    Show package status\n"
-        "  -W, --show <pkg.deb>                  Show name and version\n"
-        "      --showformat=<pkg.deb>            Like --show, uses --format= explicitly\n"
-        "      --info <pkg.deb>                  Show package file info\n"
-        "      --contents <pkg.deb>              List contents of package\n"
-        "      --extract <pkg.deb> <dir>         Extract package files to dir\n"
+        "  -s, --status  <pkg>                   Show package status\n"
+        "  -W, --show    <pkg.deb>               Show package name and version\n"
+        "      --info    <pkg.deb>               Show detailed package file info\n"
+        "      --contents <pkg.deb>              List contents of a package\n"
+        "      --extract  <pkg.deb> <dir>        Extract package files to dir\n"
         "      --vextract <pkg.deb> <dir>        Extract verbosely to dir\n"
-        "      --field <pkg.deb> [field ...]     Show control field(s)\n"
-        "      --help, -?                        Show this help\n"
+        "      --field    <pkg.deb> [field ...]  Show control field(s)\n"
+        "      --help, -?                        Show this help\n",
+        prog);
+    fprintf(stderr,
         "\n"
         "Options:\n"
-        "  -f                             Force install despite dep errors\n"
-        "  --simulate, --dry-run,\n"
-        "    --no-act                     Simulate actions without applying\n"
-        "  --root=PATH                    Set both admindir and instdir prefix\n"
-        "  --admindir=DIR                 Override database directory\n"
-        "  --instdir=DIR                  Override installation target directory\n"
-        "  --log=FILE                     Log operations to FILE\n"
-        "  --format=auto|new|old          Force package format for reading (default: auto)\n"
-        "  --deb-format=2.0|0.939000      Package format for --build (default: 2.0)\n"
-        "  -Z gzip|xz|zstd|none          Compression for --build (default: gzip)\n"
-        "  --compression=gzip|xz|...     Same as -Z\n"
-        "  -z <level>                     Compression level (0-9) for --build\n"
-        "  --compression-level=<level>   Same as -z\n"
-        "  -S <strategy>                  Compression strategy for --build (gzip/xz only)\n"
-        "  --compression-strategy=<s>    Same as -S\n"
-        "                                 gzip: filtered, huffman, rle, fixed\n"
-        "                                 xz:   none, extreme\n"
-        "  -v, --verbose                  Verbose output during --build\n"
-        "  --root-owner-group             Make perm warnings in --build into errors\n"
-        "  --ignore-depends=P1[,P2,...]   Ignore dependency on listed packages\n"
-        "  --force-script-chrootless      Skip chroot, run scripts on host\n"
-        "  --force-not-root               Skip superuser privilege check\n"
-        "  --force-overwrite              Allow overwriting files from other packages\n"
-        "  --force-overwrite-dir          Allow overwriting dirs from other packages\n"
-        "  --force-confnew                Always install maintainer's conffile version\n"
-        "  --force-confold                Always keep existing conffile version\n"
-        "  -E, --skip-same-version        Skip install if same version already installed\n"
-        "  -G, --refuse-downgrade         Skip install if it would downgrade the package\n"
-        "  --no-check, --nocheck          Skip PATH tool availability checks\n"
-        "  --abort-after=<n>              Abort batch operation after <n> errors\n"
-        "  --status-fd <n>               Send status updates to file descriptor <n>\n"
-        "  --status-fd=<n>               Same as --status-fd <n>\n"
-        "  --status-logger <cmd>         Send status updates to <cmd>'s stdin\n"
-        "  --status-logger=<cmd>         Same as --status-logger <cmd>\n"
-        "  -T internal|external           Tar implementation (default: internal)\n"
-        "  --tar-implementation=...       Same as -T\n"
-        "  -t auto|gnu|pax|ustar|v7       Tar format (default: auto)\n"
-        "  --tar-format=...               Same as -t\n"
-        "                                 Note: --build defaults to pax when auto\n"
-        "  --no-pager                     Do not use a pager for -l output\n"
-        "  --force-all                    Enable all --force-* options\n",
-        prog);
+        "  General:\n"
+        "    --simulate, --dry-run, --no-act     Simulate, do not apply changes\n"
+        "    --root=<path>                        Set admindir and instdir prefix\n"
+        "    --admindir=<dir>                     Override database directory\n"
+        "    --instdir=<dir>                      Override installation root\n"
+        "    --log=<file>                         Log operations to file\n"
+        "    --force-not-root                     Skip superuser privilege check\n"
+        "    --no-check, --nocheck                Skip tool availability checks\n"
+        "    --abort-after=<n>                    Stop batch after <n> errors\n"
+        "\n"
+        "  Package format:\n"
+        "    --format=auto|new|old                Force package format (default: auto)\n"
+        "    --deb-format=2.0|0.939000            Build format (default: 2.0)\n"
+        "\n"
+        "  Compression (--build):\n"
+        "    -Z gzip|xz|zstd|none                 Compression algorithm (default: gzip)\n"
+        "    -z <level>                           Compression level 0-9\n"
+        "    -S <strategy>                        Compression strategy\n"
+        "                                          gzip: filtered, huffman, rle, fixed\n"
+        "                                          xz:   none, extreme\n"
+        "    -v, --verbose                        Verbose output during build\n"
+        "\n"
+        "  Dependencies:\n"
+        "    --ignore-depends=<p>[,<p2>,...]      Ignore listed dependencies\n"
+        "    -E, --skip-same-version              Skip if same version installed\n"
+        "    -G, --refuse-downgrade               Skip if it would be a downgrade\n"
+        "\n"
+        "  Conffile handling:\n"
+        "    --force-confnew                      Always use maintainer version\n"
+        "    --force-confold                      Always keep installed version\n"
+        "\n"
+        "  Force options:\n"
+        "    --force-overwrite                    Allow overwriting files\n"
+        "    --force-overwrite-dir                Allow overwriting directories\n"
+        "    --force-all                          Enable all --force-* options\n"
+        "\n"
+        "  Status notifications:\n"
+        "    --status-fd <n>                      Send status updates to fd <n>\n"
+        "    --status-logger <cmd>                Send status updates to cmd stdin\n"
+        "\n"
+        "  Tar backend:\n"
+        "    -T internal|external                 Tar implementation (default: internal)\n"
+        "    --tar-implementation=<impl>          Same as -T\n"
+        "    -t auto|gnu|pax|ustar|v7             Tar format (default: auto)\n"
+        "    --tar-format=<fmt>                   Same as -t\n"
+        "\n"
+        "  Triggers:\n"
+        "    --no-triggers                        Skip trigger processing\n"
+        "    --no-pager                           Do not use a pager for -l output\n"
+        "    --trigger <name>                     Activate a trigger (like dpkg-trigger)\n"
+        "      --by-package=<pkg>                   Attribute activation to pkg\n"
+        "      --no-await                            Do not put activating pkg in await\n"
+        "      --await                               Put activating pkg in await (default)\n"
+        "      --check-supported                     Exit 0 if triggers are supported\n"
+        "      --no-act                              Test only, do not change anything\n"
+    );
 }
 
 static const char *normalize_action(const char *arg) {
@@ -1803,6 +1851,7 @@ static const char *action_long_name(const char *a) {
     if (strcmp(a, "--help")     == 0) return "--help";
     if (strcmp(a, "-h")         == 0) return "--help";
     if (strcmp(a, "-?")         == 0) return "--help";
+    if (strcmp(a, "--trigger")  == 0) return "--trigger";
     return NULL;
 }
 
@@ -1955,6 +2004,8 @@ int main(int argc, char *argv[]) {
             g_refuse_downgrade = 1;
         } else if (strcmp(argv[i], "--no-pager") == 0) {
             g_no_pager = 1;
+        } else if (strcmp(argv[i], "--no-triggers") == 0) {
+            g_no_triggers = 1;
         } else if (strcmp(argv[i], "--no-check") == 0
                    || strcmp(argv[i], "--nocheck") == 0) {
             g_no_check = 1;
@@ -2252,9 +2303,53 @@ int main(int argc, char *argv[]) {
         sn_close(); log_close();
         return ret == 0 ? 0 : 1;
     }
+    if (strcmp(fwd[1], "--trigger") == 0) {
+        const char *trigname   = NULL;
+        const char *by_pkg     = NULL;
+        int         noawait    = 0;
+        int         no_act     = g_simulate;
+        int         check_sup  = 0;
+        int         ai;
+        for (ai = 2; ai < nfwd; ai++) {
+            if (strcmp(fwd[ai], "--check-supported") == 0) {
+                check_sup = 1;
+            } else if (strcmp(fwd[ai], "--no-await") == 0) {
+                noawait = 1;
+            } else if (strcmp(fwd[ai], "--await") == 0) {
+                noawait = 0;
+            } else if (strcmp(fwd[ai], "--no-act") == 0) {
+                no_act = 1;
+            } else if (strncmp(fwd[ai], "--by-package=", 13) == 0) {
+                by_pkg = fwd[ai] + 13;
+            } else if (strcmp(fwd[ai], "--by-package") == 0) {
+                if (ai + 1 < nfwd)
+                    by_pkg = fwd[++ai];
+            } else if (strncmp(fwd[ai], "--admindir=", 11) == 0) {
+                trig_set_admindir(fwd[ai] + 11);
+            } else if (strcmp(fwd[ai], "--admindir") == 0) {
+                if (ai + 1 < nfwd)
+                    trig_set_admindir(fwd[++ai]);
+            } else if (fwd[ai][0] != '-') {
+                trigname = fwd[ai];
+            }
+        }
+        if (admindir_arg[0])
+            trig_set_admindir(admindir_arg);
+        if (check_sup) {
+            sn_close(); log_close();
+            return op_check_supported();
+        }
+        {
+            int rc = op_trigger(trigname, by_pkg, noawait, no_act);
+            sn_close(); log_close();
+            return rc;
+        }
+    }
     db_set_root(g_root);
-    if (admindir_arg[0])
+    if (admindir_arg[0]) {
         db_set_admindir(admindir_arg);
+        trig_set_admindir(admindir_arg);
+    }
     if (admindir_arg[0]) {
         char lkpath[8192];
         snprintf(lkpath, sizeof(lkpath), "%s/lock", admindir_arg);
