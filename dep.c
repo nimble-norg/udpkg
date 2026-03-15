@@ -1,10 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
+#include <dirent.h>
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include "dep.h"
 #include "db.h"
+#include "ctrl.h"
 
 #define IGNORE_MAX 64
 
@@ -228,6 +230,107 @@ static const char *op_str(int op) {
     return "";
 }
 
+static int pkg_provides(const char *pkgname, const char *virtual_name,
+                        int vop, const char *vver) {
+    ctrl_t c;
+    const char *prov;
+    dep_list_t dl;
+    int i, j;
+    if (db_get(pkgname, &c) != 0)
+        return 0;
+    prov = ctrl_get(&c, "Provides");
+    if (!prov)
+        return 0;
+    dep_parse(prov, &dl);
+    for (i = 0; i < dl.ngroups; i++) {
+        for (j = 0; j < dl.groups[i].nalts; j++) {
+            if (strcmp(dl.groups[i].alts[j], virtual_name) == 0) {
+                if (vop == DEPOP_NONE)
+                    return 1;
+                {
+                    const char *pver = dl.groups[i].alt_ver[j];
+                    if (pver[0] == '\0')
+                        return (vop == DEPOP_NONE);
+                    return ver_satisfies(pver, vop, vver);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static int any_installed_provides(const char *virtual_name, int vop,
+                                   const char *vver) {
+    char info_dir[4096];
+    DIR *dir;
+    struct dirent *de;
+    int found = 0;
+    apath_pub(info_dir, sizeof(info_dir), "/info");
+    dir = opendir(info_dir);
+    if (!dir)
+        return 0;
+    while (!found && (de = readdir(dir)) != NULL) {
+        char *dot;
+        char pkgname[256];
+        size_t nlen;
+        if (de->d_name[0] == '.')
+            continue;
+        dot = strrchr(de->d_name, '.');
+        if (!dot || strcmp(dot, ".list") != 0)
+            continue;
+        nlen = (size_t)(dot - de->d_name);
+        if (nlen == 0 || nlen >= sizeof(pkgname))
+            continue;
+        memcpy(pkgname, de->d_name, nlen);
+        pkgname[nlen] = '\0';
+        if (pkg_provides(pkgname, virtual_name, vop, vver))
+            found = 1;
+    }
+    closedir(dir);
+    return found;
+}
+
+static int pkg_is_active(const char *name) {
+    ctrl_t c;
+    const char *sv;
+    char sel[64], flag[64], state[64];
+    if (db_get(name, &c) != 0)
+        return 0;
+    sv = ctrl_get(&c, "Status");
+    if (!sv)
+        return 0;
+    if (sscanf(sv, "%63s %63s %63s", sel, flag, state) < 3)
+        return 0;
+    return (strcmp(state, "installed")      == 0 ||
+            strcmp(state, "unpacked")       == 0 ||
+            strcmp(state, "half-installed") == 0 ||
+            strcmp(state, "half-configured") == 0 ||
+            strcmp(state, "triggers-pending") == 0 ||
+            strcmp(state, "triggers-awaited") == 0);
+}
+
+static void format_dep(char *slot, size_t sz, const char *name,
+                        int op, const char *ver) {
+    if (op != DEPOP_NONE) {
+        size_t nlen = strlen(name);
+        const char *ops = op_str(op);
+        size_t olen = strlen(ops);
+        size_t vlen = strlen(ver);
+        size_t pos = 0;
+        if (nlen > sz - 1) nlen = sz - 1;
+        memcpy(slot, name, nlen); pos = nlen;
+        if (pos + 2 < sz) { slot[pos++] = ' '; slot[pos++] = '('; }
+        if (pos + olen < sz) { memcpy(slot + pos, ops, olen); pos += olen; }
+        if (pos + 1 < sz)  slot[pos++] = ' ';
+        if (pos + vlen < sz) { memcpy(slot + pos, ver, vlen); pos += vlen; }
+        if (pos + 1 < sz)  slot[pos++] = ')';
+        slot[pos < sz ? pos : sz - 1] = '\0';
+    } else {
+        strncpy(slot, name, sz - 1);
+        slot[sz - 1] = '\0';
+    }
+}
+
 int dep_check(const dep_list_t *dl,
               const char * const *batch, int nbatch,
               char missing[][DEP_MISS_MAX], int *nmissing, int miss_cap) {
@@ -238,13 +341,13 @@ int dep_check(const dep_list_t *dl,
         int satisfied = 0;
         for (j = 0; j < g->nalts && !satisfied; j++) {
             const char *aname = g->alts[j];
-            int aop = g->alt_op[j];
-            const char *aver = g->alt_ver[j];
+            int aop            = g->alt_op[j];
+            const char *aver   = g->alt_ver[j];
             if (is_ignored(aname)) {
                 satisfied = 1;
                 break;
             }
-            if (db_is_installed(aname)) {
+            if (pkg_is_active(aname)) {
                 if (aop == DEPOP_NONE) {
                     satisfied = 1;
                 } else {
@@ -253,40 +356,90 @@ int dep_check(const dep_list_t *dl,
                         && ver_satisfies(inst_ver, aop, aver))
                         satisfied = 1;
                 }
-                if (satisfied) break;
             }
-            for (k = 0; k < nbatch && !satisfied; k++) {
-                if (strcmp(batch[k], aname) == 0) {
-                    satisfied = 1;
+            if (!satisfied && any_installed_provides(aname, aop, aver))
+                satisfied = 1;
+            if (!satisfied) {
+                for (k = 0; k < nbatch && !satisfied; k++) {
+                    if (strcmp(batch[k], aname) == 0)
+                        satisfied = 1;
                 }
             }
         }
         if (!satisfied && *nmissing < miss_cap) {
-            const char *aname = g->alts[0];
-            int aop = g->alt_op[0];
-            const char *aver = g->alt_ver[0];
-            char *slot = missing[*nmissing];
-            size_t sz = (size_t)DEP_MISS_MAX;
-            if (aop != DEPOP_NONE) {
-                size_t nlen = strlen(aname);
-                const char *ops = op_str(aop);
-                size_t olen = strlen(ops);
-                size_t vlen = strlen(aver);
-                size_t pos = 0;
-                if (nlen > sz - 1) nlen = sz - 1;
-                memcpy(slot, aname, nlen); pos = nlen;
-                if (pos + 2 < sz) { slot[pos++] = ' '; slot[pos++] = '('; }
-                if (pos + olen < sz) { memcpy(slot + pos, ops, olen); pos += olen; }
-                if (pos + 1 < sz)  slot[pos++] = ' ';
-                if (pos + vlen < sz) { memcpy(slot + pos, aver, vlen); pos += vlen; }
-                if (pos + 1 < sz)  slot[pos++] = ')';
-                slot[pos < sz ? pos : sz - 1] = '\0';
+            if (g->nalts == 1) {
+                format_dep(missing[*nmissing], (size_t)DEP_MISS_MAX,
+                           g->alts[0], g->alt_op[0], g->alt_ver[0]);
             } else {
-                strncpy(slot, aname, sz - 1);
-                slot[sz - 1] = '\0';
+                char tmp[DEP_MISS_MAX];
+                size_t pos = 0;
+                for (j = 0; j < g->nalts; j++) {
+                    char part[128];
+                    format_dep(part, sizeof(part),
+                               g->alts[j], g->alt_op[j], g->alt_ver[j]);
+                    if (j > 0 && pos + 3 < (size_t)DEP_MISS_MAX - 1) {
+                        memcpy(tmp + pos, " | ", 3);
+                        pos += 3;
+                    }
+                    {
+                        size_t plen = strlen(part);
+                        if (pos + plen >= (size_t)DEP_MISS_MAX - 1)
+                            plen = (size_t)DEP_MISS_MAX - 1 - pos;
+                        memcpy(tmp + pos, part, plen);
+                        pos += plen;
+                    }
+                }
+                tmp[pos] = '\0';
+                strncpy(missing[*nmissing], tmp, (size_t)DEP_MISS_MAX - 1);
+                missing[*nmissing][(size_t)DEP_MISS_MAX - 1] = '\0';
             }
             (*nmissing)++;
         }
     }
     return *nmissing == 0 ? 0 : -1;
+}
+
+int dep_check_conflicts(const char *pkgname, const char *conflicts_str,
+                         const char * const *batch, int nbatch) {
+    dep_list_t dl;
+    int i, j, k, found = 0;
+    dep_parse(conflicts_str, &dl);
+    for (i = 0; i < dl.ngroups; i++) {
+        const dep_group_t *g = &dl.groups[i];
+        for (j = 0; j < g->nalts; j++) {
+            const char *cname = g->alts[j];
+            int cop = g->alt_op[j];
+            const char *cver = g->alt_ver[j];
+            if (strcmp(cname, pkgname) == 0)
+                continue;
+            if (is_ignored(cname))
+                continue;
+            if (pkg_is_active(cname)) {
+                int conflict = 0;
+                if (cop == DEPOP_NONE) {
+                    conflict = 1;
+                } else {
+                    char inst_ver[DEP_VER_MAX];
+                    if (db_get_version(cname, inst_ver, sizeof(inst_ver)) == 0
+                        && ver_satisfies(inst_ver, cop, cver))
+                        conflict = 1;
+                }
+                if (conflict) {
+                    fprintf(stderr,
+                        "udpkg: %s conflicts with installed package %s\n",
+                        pkgname, cname);
+                    found = 1;
+                }
+            }
+            for (k = 0; k < nbatch; k++) {
+                if (strcmp(batch[k], cname) == 0) {
+                    fprintf(stderr,
+                        "udpkg: %s conflicts with %s (in batch)\n",
+                        pkgname, cname);
+                    found = 1;
+                }
+            }
+        }
+    }
+    return found ? -1 : 0;
 }

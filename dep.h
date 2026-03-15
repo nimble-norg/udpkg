@@ -36,3 +36,6 @@ int dep_check(const dep_list_t *dl,
 int ver_cmp_public(const char *a, const char *b);
 
 #endif
+
+int dep_check_conflicts(const char *pkgname, const char *conflicts_str,
+                         const char * const *batch, int nbatch);
