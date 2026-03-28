@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE 700
 #include "tar_impl.h"
 #include <stdio.h>
@@ -16,6 +17,12 @@
 #include <time.h>
 #include <pwd.h>
 #include <grp.h>
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000
+#endif
+#ifndef O_TMPFILE
+#define O_TMPFILE (020000000 | 0200000)
+#endif
 
 #define BLOCK_SIZE      512
 #define RECORDS_PER_BLK 20
@@ -750,7 +757,6 @@ static int extract_entry(const entry_meta *m, const char *destdir,
                           rstream *rs, int verbose) {
     char fullpath[PATH_MAX * 2];
     size_t blocks, i;
-    struct stat dst_st;
     if (m->path[0] == '/' || strstr(m->path, "..")) {
         off_t skip_blocks = (m->size + BLOCK_SIZE - 1) / BLOCK_SIZE;
         char block[BLOCK_SIZE];
@@ -812,12 +818,32 @@ static int extract_entry(const entry_meta *m, const char *destdir,
         return 0;
     }
     {
-        int fd;
+        int fd = -1;
+        int use_tmpfile = 0;
+        char tmppath[PATH_MAX * 4 + 16];
         off_t written = 0;
         char block[BLOCK_SIZE];
-        int already_exists = (lstat(fullpath, &dst_st) == 0);
-        (void)already_exists;
-        fd = open(fullpath, O_WRONLY | O_CREAT | O_TRUNC, m->mode & 0777);
+        char *slash;
+        char dirpart[PATH_MAX * 2];
+        const char *basename_p;
+        strncpy(dirpart, fullpath, sizeof(dirpart) - 1);
+        dirpart[sizeof(dirpart) - 1] = '\0';
+        slash = strrchr(dirpart, '/');
+        if (slash && slash != dirpart) {
+            *slash = '\0';
+            basename_p = fullpath + (slash - dirpart) + 1;
+        } else {
+            strncpy(dirpart, ".", sizeof(dirpart) - 1);
+            basename_p = fullpath;
+        }
+        fd = open(dirpart, O_TMPFILE | O_WRONLY, m->mode & 0777);
+        if (fd >= 0) {
+            use_tmpfile = 1;
+        } else {
+            snprintf(tmppath, sizeof(tmppath), "%s/.%s.tmp",
+                     dirpart, basename_p);
+            fd = open(tmppath, O_WRONLY | O_CREAT | O_TRUNC, m->mode & 0777);
+        }
         if (fd < 0) {
             fprintf(stderr, "tar: cannot create '%s': %s\n",
                     fullpath, strerror(errno));
@@ -828,18 +854,52 @@ static int extract_entry(const entry_meta *m, const char *destdir,
         blocks = (size_t)((m->size + BLOCK_SIZE - 1) / BLOCK_SIZE);
         for (i = 0; i < blocks; i++) {
             size_t take;
-            if (rs_read_block(rs, block) != 0) { close(fd); return -1; }
+            if (rs_read_block(rs, block) != 0) {
+                close(fd);
+                if (!use_tmpfile) unlink(tmppath);
+                return -1;
+            }
             take = (size_t)(m->size - written);
             if (take > BLOCK_SIZE) take = BLOCK_SIZE;
             if (write(fd, block, take) != (ssize_t)take) {
                 close(fd);
+                if (!use_tmpfile) unlink(tmppath);
                 return -1;
             }
             written += (off_t)take;
         }
-        close(fd);
+        if (fdatasync(fd) != 0) {
+            close(fd);
+            if (!use_tmpfile) unlink(tmppath);
+            return -1;
+        }
         if (m->mode & 07000)
-            chmod(fullpath, m->mode & 07777);
+            fchmod(fd, m->mode & 07777);
+        else
+            fchmod(fd, m->mode & 0777);
+        if (use_tmpfile) {
+            snprintf(tmppath, sizeof(tmppath), "/proc/self/fd/%d", fd);
+            if (linkat(AT_FDCWD, tmppath, AT_FDCWD, fullpath,
+                       AT_EMPTY_PATH) != 0) {
+                use_tmpfile = 0;
+                snprintf(tmppath, sizeof(tmppath), "%s/.%s.tmp",
+                         dirpart, basename_p);
+                if (linkat(AT_FDCWD, tmppath, AT_FDCWD, fullpath,
+                           AT_EMPTY_PATH) != 0) {
+                    close(fd);
+                    return -1;
+                }
+            }
+            close(fd);
+        } else {
+            close(fd);
+            if (rename(tmppath, fullpath) != 0) {
+                unlink(tmppath);
+                fprintf(stderr, "tar: cannot rename '%s' to '%s': %s\n",
+                        tmppath, fullpath, strerror(errno));
+                return -1;
+            }
+        }
     }
     {
         struct utimbuf ut;
